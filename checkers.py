@@ -1,7 +1,13 @@
-"""HWPX 문서 검사 모듈 - 7가지 검사 규칙"""
+"""HWPX 문서 검사 모듈 - 검사 규칙"""
+
+from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from hwpx_reader import ParagraphInfo
 
 
 @dataclass
@@ -12,6 +18,8 @@ class CheckResult:
     message: str       # 설명
     paragraph: int     # 문단 번호 (1-based)
     text: str          # 해당 문단 원문 (일부)
+    page: int = 0      # 페이지 번호 (1-based, 0=알 수 없음)
+    line: int = 0      # 줄 번호 (1-based, 0=알 수 없음)
 
 
 # ──────────────────────────────────────────────
@@ -109,42 +117,58 @@ def check_typos(paragraphs: list[str]) -> list[CheckResult]:
 # ──────────────────────────────────────────────
 # 같은 단어가 다르게 띄어쓰기되는 경우만 체크
 def check_spacing_consistency(paragraphs: list[str]) -> list[CheckResult]:
-    """같은 단어가 다르게 띄어쓰기된 경우만 검사한다."""
+    """같은 단어가 다르게 띄어쓰기된 경우만 검사한다.
+
+    예: '세무조사 기간연장통지서' vs '세무조사기간연장통지서'
+    """
     results = []
 
-    # 전체 문서에서 단어와 그 띄어쓰기 방식 수집
-    spacing_variants: dict[str, list[tuple[int, int, str]]] = {}  # 단어 → [(문단, 위치, 형태)]
+    # 1단계: 모든 한글 어절(단어)을 추출하여 n-gram 생성
+    # 각 문단에서 연속된 한글 단어 2~6개의 조합을 만듦
+    # spacing_variants: {정규화된문자열: [(문단번호, 위치, 원본형태), ...]}
+    spacing_variants: dict[str, list[tuple[int, int, str]]] = {}
 
-    # 단어를 정규화하여 같은 단어의 다양한 형태 찾기
-    full_text = "\n".join(paragraphs)
-    para_offsets = [0]
-    for p in paragraphs:
-        para_offsets.append(para_offsets[-1] + len(p) + 1)
-
-    # 예: "세무조사 기간연장통지서", "세무조사기간연장통지서", "세무조사 기간 연장 통지서"
-    # 공백을 제거한 것을 키로, 실제 형태를 값으로 저장
     for idx, para in enumerate(paragraphs, 1):
-        # 한글 + 숫자 조합 찾기
-        for m in re.finditer(r"[가-힣0-9]+(?:\s[가-힣0-9]+)*", para):
-            phrase = m.group()
-            normalized = phrase.replace(" ", "")  # 공백 제거한 버전
-            if normalized and len(normalized) > 2:  # 2글자 이상만
+        # 한글 어절 위치 추출
+        words = list(re.finditer(r"[가-힣]+", para))
+
+        # 연속 단어 n-gram (2~6개 조합)
+        for n in range(2, min(7, len(words) + 1)):
+            for i in range(len(words) - n + 1):
+                group = words[i:i + n]
+                start = group[0].start()
+                end = group[-1].end()
+                phrase = para[start:end]
+                normalized = phrase.replace(" ", "")
+
+                if len(normalized) < 4:  # 4글자 미만은 무시
+                    continue
+
                 if normalized not in spacing_variants:
                     spacing_variants[normalized] = []
-                spacing_variants[normalized].append((idx, m.start(), phrase))
+                spacing_variants[normalized].append((idx, start, phrase))
 
-    # 같은 단어가 여러 방식으로 사용된 경우 경고
+    # 2단계: 같은 정규화 문자열에 서로 다른 형태가 있으면 경고
+    reported: set[tuple[int, int]] = set()  # (문단, 위치) 중복 방지
     for normalized, variants in spacing_variants.items():
-        if len(set(v[2] for v in variants)) > 1:  # 형태가 다른 경우
-            forms = list(set(v[2] for v in variants))
-            for idx, pos, phrase in variants:
-                results.append(CheckResult(
-                    rule="띄어쓰기 일관성",
-                    severity="warning",
-                    message=f"'{phrase}' — 문서 내 다른 표기: {', '.join(f for f in forms if f != phrase)}",
-                    paragraph=idx,
-                    text=_snippet(paragraphs[idx-1], pos, len(phrase)),
-                ))
+        unique_forms = set(v[2] for v in variants)
+        if len(unique_forms) <= 1:
+            continue
+
+        forms = list(unique_forms)
+        for para_idx, pos, phrase in variants:
+            key = (para_idx, pos)
+            if key in reported:
+                continue
+            reported.add(key)
+            other_forms = [f for f in forms if f != phrase]
+            results.append(CheckResult(
+                rule="띄어쓰기 일관성",
+                severity="warning",
+                message=f"'{phrase}' — 문서 내 다른 표기: {', '.join(other_forms)}",
+                paragraph=para_idx,
+                text=_snippet(paragraphs[para_idx - 1], pos, len(phrase)),
+            ))
 
     return results
 
@@ -418,19 +442,38 @@ ALL_CHECKERS = [
 
 
 def run_all_checks(paragraphs: list[str],
-                   enabled: list[str] | None = None) -> list[CheckResult]:
+                   enabled: list[str] | None = None,
+                   para_infos: list[ParagraphInfo] | None = None,
+                   ) -> list[CheckResult]:
     """모든 검사를 실행하고 결과를 반환한다.
 
     Args:
         paragraphs: 검사할 문단 리스트
         enabled: 실행할 검사 이름 리스트. None이면 전체 실행.
+        para_infos: ParagraphInfo 리스트 (페이지/줄 정보 포함). 있으면 결과에 반영.
     """
     results = []
     for name, checker in ALL_CHECKERS:
         if enabled and name not in enabled:
             continue
         results.extend(checker(paragraphs))
+
+    # para_infos가 있으면 결과에 페이지/줄 정보를 채운다
+    if para_infos:
+        _fill_position_info(results, para_infos)
+
     return results
+
+
+def _fill_position_info(results: list[CheckResult],
+                        para_infos: list[ParagraphInfo]) -> None:
+    """CheckResult에 페이지/줄 정보를 채운다."""
+    for r in results:
+        idx = r.paragraph - 1  # 0-based
+        if 0 <= idx < len(para_infos):
+            info = para_infos[idx]
+            r.page = info.page
+            r.line = info.line
 
 
 # ──────────────────────────────────────────────

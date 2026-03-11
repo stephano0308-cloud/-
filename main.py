@@ -13,7 +13,7 @@ import json
 import os
 import sys
 
-from hwpx_reader import read_hwpx, read_text_file
+from hwpx_reader import read_hwpx_with_position, read_text_file_with_position, ParagraphInfo
 from checkers import run_all_checks, ALL_CHECKERS, CheckResult
 
 
@@ -23,18 +23,17 @@ def parse_args() -> argparse.Namespace:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 검사 규칙:
-  오탈자      흔한 한국어 오탈자 패턴 검사
-  띄어쓰기    의존명사, 보조용언 등 띄어쓰기 검사
-  조항 형식   제○조/제○항/제○호 표기 형식 검사
-  숫자 표기   천 단위 쉼표, 단위 띄어쓰기 등 검사
-  날짜 형식   날짜 유효성 및 구분자 통일 검사
-  괄호 짝     괄호/낫표 등 짝 맞춤 검사
-  법령 인용   법령명 낫표, 조항 붙여쓰기 등 검사
+  오탈자          흔한 한국어 오탈자 패턴 검사
+  띄어쓰기 일관성  같은 단어의 띄어쓰기 불일치 검사
+  조항 형식       제○조/제○항/제○호 표기 형식 검사
+  날짜 형식       날짜 유효성 및 구분자 통일 검사
+  괄호 짝         괄호/낫표 등 짝 맞춤 검사
+  법령 인용       법령명 낫표, 조항 붙여쓰기 등 검사
 
 예시:
-  python main.py 계약서.hwpx
-  python main.py 계약서.hwpx --rules 오탈자 띄어쓰기 괄호짝
-  python main.py 계약서.hwpx --json --output result.json
+  hwpx_checker 계약서.hwpx
+  hwpx_checker 계약서.hwpx --rules 오탈자 "괄호 짝"
+  hwpx_checker 계약서.hwpx --json --output result.json
         """,
     )
     parser.add_argument("file", help="검사할 파일 경로 (.hwpx 또는 .txt)")
@@ -62,16 +61,26 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def load_document(filepath: str) -> list[str]:
+def load_document(filepath: str) -> list[ParagraphInfo]:
     """파일 확장자에 따라 적절한 리더를 사용한다."""
     ext = os.path.splitext(filepath)[1].lower()
     if ext == ".hwpx":
-        return read_hwpx(filepath)
+        return read_hwpx_with_position(filepath)
     elif ext in (".txt", ".md", ".rst"):
-        return read_text_file(filepath)
+        return read_text_file_with_position(filepath)
     else:
         print(f"[알림] 확장자 '{ext}'는 텍스트 파일로 처리합니다.", file=sys.stderr)
-        return read_text_file(filepath)
+        return read_text_file_with_position(filepath)
+
+
+def _format_location(r: CheckResult) -> str:
+    """CheckResult의 위치를 '페이지 줄' 형식으로 포맷한다."""
+    if r.page > 0 and r.line > 0:
+        return f"{r.page}페이지 {r.line}줄"
+    elif r.page > 0:
+        return f"{r.page}페이지"
+    else:
+        return f"문단 {r.paragraph}"
 
 
 def format_text_report(results: list[CheckResult], filepath: str,
@@ -105,7 +114,8 @@ def format_text_report(results: list[CheckResult], filepath: str,
         if not summary_only:
             for r in rule_results:
                 severity_mark = "[오류]" if r.severity == "error" else "[경고]"
-                lines.append(f"  {severity_mark} 문단 {r.paragraph}: {r.message}")
+                location = _format_location(r)
+                lines.append(f"  {severity_mark} {location}: {r.message}")
                 lines.append(f"         >> {r.text}")
         lines.append("")
 
@@ -125,6 +135,8 @@ def format_json_report(results: list[CheckResult], filepath: str) -> str:
                 "rule": r.rule,
                 "severity": r.severity,
                 "message": r.message,
+                "page": r.page,
+                "line": r.line,
                 "paragraph": r.paragraph,
                 "context": r.text,
             }
@@ -139,19 +151,20 @@ def main():
 
     # 파일 읽기
     try:
-        paragraphs = load_document(args.file)
+        para_infos = load_document(args.file)
     except (FileNotFoundError, ValueError) as e:
         print(f"오류: {e}", file=sys.stderr)
         sys.exit(1)
 
-    if not paragraphs:
+    if not para_infos:
         print("문서에서 텍스트를 추출할 수 없습니다.", file=sys.stderr)
         sys.exit(1)
 
+    paragraphs = [info.text for info in para_infos]
     print(f"문서에서 {len(paragraphs)}개 문단을 추출했습니다.", file=sys.stderr)
 
     # 검사 실행
-    results = run_all_checks(paragraphs, enabled=args.rules)
+    results = run_all_checks(paragraphs, enabled=args.rules, para_infos=para_infos)
 
     # 결과 포맷
     if args.json:
