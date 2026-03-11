@@ -105,42 +105,47 @@ def check_typos(paragraphs: list[str]) -> list[CheckResult]:
 
 
 # ──────────────────────────────────────────────
-# 2. 띄어쓰기 검사
+# 2. 띄어쓰기 일관성 검사
 # ──────────────────────────────────────────────
-_SPACING_PATTERNS: list[tuple[str, str, str]] = [
-    # (패턴, 올바른 형태, 설명)
-    (r"할수있", "할 수 있", "보조용언 띄어쓰기"),
-    (r"할수없", "할 수 없", "보조용언 띄어쓰기"),
-    (r"할수록", "할수록", ""),  # 이것은 올바름, 검사 제외
-    (r"것같", "것 같", "의존명사 띄어쓰기"),
-    (r"수있", "수 있", "의존명사 띄어쓰기"),
-    (r"수없", "수 없", "의존명사 띄어쓰기"),
-    (r"데있어", "데 있어", "의존명사 띄어쓰기"),
-    (r"바있", "바 있", "의존명사 띄어쓰기"),
-    (r"뿐만아니라", "뿐만 아니라", "접속부사 띄어쓰기"),
-    (r"뿐아니라", "뿐 아니라", "접속부사 띄어쓰기"),
-    (r"그리고또", "그리고 또", "접속부사 띄어쓰기"),
-    (r"및또는", "및 또는", "접속사 띄어쓰기"),
-    (r"때문에(?=[가-힣])", "때문에 ", "띄어쓰기"),
-    (r"(?<=[가-힣])등(?=[가-힣])", " 등 ", "의존명사 '등' 띄어쓰기"),
-]
-
-
-def check_spacing(paragraphs: list[str]) -> list[CheckResult]:
-    """띄어쓰기 오류를 검사한다."""
+# 같은 단어가 다르게 띄어쓰기되는 경우만 체크
+def check_spacing_consistency(paragraphs: list[str]) -> list[CheckResult]:
+    """같은 단어가 다르게 띄어쓰기된 경우만 검사한다."""
     results = []
+
+    # 전체 문서에서 단어와 그 띄어쓰기 방식 수집
+    spacing_variants: dict[str, list[tuple[int, int, str]]] = {}  # 단어 → [(문단, 위치, 형태)]
+
+    # 단어를 정규화하여 같은 단어의 다양한 형태 찾기
+    full_text = "\n".join(paragraphs)
+    para_offsets = [0]
+    for p in paragraphs:
+        para_offsets.append(para_offsets[-1] + len(p) + 1)
+
+    # 예: "세무조사 기간연장통지서", "세무조사기간연장통지서", "세무조사 기간 연장 통지서"
+    # 공백을 제거한 것을 키로, 실제 형태를 값으로 저장
     for idx, para in enumerate(paragraphs, 1):
-        for pattern, correct, desc in _SPACING_PATTERNS:
-            if not desc:  # 올바른 패턴이라 검사 제외
-                continue
-            for m in re.finditer(pattern, para):
+        # 한글 + 숫자 조합 찾기
+        for m in re.finditer(r"[가-힣0-9]+(?:\s[가-힣0-9]+)*", para):
+            phrase = m.group()
+            normalized = phrase.replace(" ", "")  # 공백 제거한 버전
+            if normalized and len(normalized) > 2:  # 2글자 이상만
+                if normalized not in spacing_variants:
+                    spacing_variants[normalized] = []
+                spacing_variants[normalized].append((idx, m.start(), phrase))
+
+    # 같은 단어가 여러 방식으로 사용된 경우 경고
+    for normalized, variants in spacing_variants.items():
+        if len(set(v[2] for v in variants)) > 1:  # 형태가 다른 경우
+            forms = list(set(v[2] for v in variants))
+            for idx, pos, phrase in variants:
                 results.append(CheckResult(
-                    rule="띄어쓰기",
+                    rule="띄어쓰기 일관성",
                     severity="warning",
-                    message=f"'{m.group()}' → '{correct}' ({desc})",
+                    message=f"'{phrase}' — 문서 내 다른 표기: {', '.join(f for f in forms if f != phrase)}",
                     paragraph=idx,
-                    text=_snippet(para, m.start(), len(m.group())),
+                    text=_snippet(paragraphs[idx-1], pos, len(phrase)),
                 ))
+
     return results
 
 
@@ -352,11 +357,11 @@ def check_brackets(paragraphs: list[str]) -> list[CheckResult]:
 #   「형사소송법」 제200조의2
 #   같은 법 제10조제1항
 _LAW_CITE_PATTERNS = [
-    # 법령명을 「」 없이 인용한 경우 (4글자 이상만 — 줄임말 제외)
+    # 법령명을 「」 없이 인용한 경우 (형법, 민법 등 모든 법령명)
     (
         re.compile(
             r"(?<![「])("
-            r"[가-힣]{4,}법|[가-힣]{4,}령|[가-힣]{4,}규칙|[가-힣]{4,}조례"
+            r"[가-힣]+법|[가-힣]+령|[가-힣]+규칙|[가-힣]+조례"
             r")(?![」])\s*제\d+"
         ),
         "법령명은 「」(낫표)로 감싸야 합니다",
@@ -404,8 +409,8 @@ def check_legal_citation(paragraphs: list[str]) -> list[CheckResult]:
 # ──────────────────────────────────────────────
 ALL_CHECKERS = [
     ("오탈자", check_typos),
+    ("띄어쓰기 일관성", check_spacing_consistency),
     ("조항 형식", check_article_format),
-    ("숫자 표기", check_number_format),
     ("날짜 형식", check_date_format),
     ("괄호 짝", check_brackets),
     ("법령 인용", check_legal_citation),
