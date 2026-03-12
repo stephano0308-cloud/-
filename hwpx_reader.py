@@ -122,9 +122,8 @@ def _parse_section_xml_with_position(
     para_tags = _find_all_tags(root, "p", ns_map)
 
     for para_elem in para_tags:
-        # pageBreak 속성 확인
-        page_break = para_elem.get("pageBreak", "0")
-        if page_break == "1" or page_break.lower() == "true":
+        # 다양한 방식으로 페이지 나눔 감지
+        if _has_page_break(para_elem, ns_map):
             current_page += 1
             current_line_in_page = 1
 
@@ -157,6 +156,48 @@ def _parse_section_xml_with_position(
         current_line_in_page += max(1, line_count)
 
     return paragraphs, current_page
+
+
+def _has_page_break(para_elem: ET.Element, ns_map: dict[str, str]) -> bool:
+    """문단에 페이지 나눔이 있는지 다양한 방식으로 확인한다."""
+    # 1. pageBreak 속성
+    for attr in ("pageBreak", "pagebreak"):
+        val = para_elem.get(attr, "0")
+        if val == "1" or val.lower() == "true":
+            return True
+
+    # 2. newPage 속성 (일부 HWPX 버전)
+    for attr in ("newPage", "newpage"):
+        val = para_elem.get(attr, "0")
+        if val == "1" or val.lower() == "true":
+            return True
+
+    # 3. 네임스페이스 포함 속성 확인
+    for attr_name, attr_val in para_elem.attrib.items():
+        local = attr_name.split("}")[-1] if "}" in attr_name else attr_name
+        if local.lower() in ("pagebreak", "newpage"):
+            if attr_val == "1" or attr_val.lower() == "true":
+                return True
+
+    # 4. <hp:ctrl> 요소의 페이지 나눔 문자 (char=13 or type="page")
+    ctrl_tags = _find_all_tags(para_elem, "ctrl", ns_map)
+    for ctrl in ctrl_tags:
+        # char 속성 확인 (0x0D = 페이지 나눔)
+        char_val = ctrl.get("char", "")
+        if char_val in ("13", "0x0D", "0x0d"):
+            return True
+        # type 속성 확인
+        ctrl_type = ctrl.get("type", "")
+        if ctrl_type.lower() in ("page", "pagebreak"):
+            return True
+
+    # 5. <hp:colPr> 내 pageBreak 확인
+    for elem in para_elem.iter():
+        local = elem.tag.split("}")[-1] if "}" in elem.tag else elem.tag
+        if local.lower() in ("pagebreak", "pagectrl"):
+            return True
+
+    return False
 
 
 def _count_lines(para_elem: ET.Element, ns_map: dict[str, str]) -> int:

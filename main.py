@@ -11,6 +11,7 @@
 import argparse
 import json
 import os
+import re
 import sys
 
 from hwpx_reader import read_hwpx_with_position, read_text_file_with_position, ParagraphInfo
@@ -107,27 +108,52 @@ def load_document(filepath: str) -> list[ParagraphInfo]:
 
 
 def _format_location(r: CheckResult) -> str:
-    """CheckResult의 위치를 '페이지 줄' 형식으로 포맷한다."""
-    if r.page > 0 and r.line > 0:
-        return f"{r.page}페이지 {r.line}줄"
-    elif r.page > 0:
-        return f"{r.page}페이지"
-    else:
-        return f"문단 {r.paragraph}"
+    """CheckResult의 위치를 포맷한다."""
+    return f"{r.paragraph}문단"
+
+
+def _extract_current_improved(r: CheckResult) -> tuple[str, str]:
+    """CheckResult의 message에서 현행/개선 텍스트를 추출한다."""
+    # "'현행' → '개선'" 패턴
+    m = re.match(r"'(.+?)'\s*→\s*'(.+?)'", r.message)
+    if m:
+        return m.group(1), m.group(2)
+    # "'현행' — 설명" 패턴
+    m = re.match(r"'(.+?)'\s*—\s*(.+)", r.message)
+    if m:
+        return m.group(1), m.group(2)
+    return r.message, ""
+
+
+def _display_width(s: str) -> int:
+    """문자열의 표시 너비를 계산한다 (한글=2, 영문/숫자=1)."""
+    width = 0
+    for ch in s:
+        if '\uac00' <= ch <= '\ud7a3' or '\u4e00' <= ch <= '\u9fff' or ch in '「」『』【】〈〉《》':
+            width += 2
+        else:
+            width += 1
+    return width
+
+
+def _pad(s: str, target_width: int) -> str:
+    """문자열을 target_width만큼 공백으로 패딩한다."""
+    current = _display_width(s)
+    return s + " " * max(0, target_width - current)
 
 
 def format_text_report(results: list[CheckResult], filepath: str,
                        summary_only: bool = False) -> str:
-    """검사 결과를 읽기 좋은 텍스트 보고서로 포맷한다."""
+    """검사 결과를 표 형식 보고서로 포맷한다."""
     lines = []
-    lines.append("=" * 60)
+    lines.append("=" * 80)
     lines.append("  HWPX 맞춤법·형식 검사 결과")
     lines.append(f"  파일: {filepath}")
-    lines.append("=" * 60)
+    lines.append("=" * 80)
 
     if not results:
         lines.append("\n  검사 결과 오류가 발견되지 않았습니다.")
-        lines.append("=" * 60)
+        lines.append("=" * 80)
         return "\n".join(lines)
 
     # 심각도별 카운트
@@ -137,22 +163,58 @@ def format_text_report(results: list[CheckResult], filepath: str,
     lines.append(f"\n  총 {len(results)}건 발견 (오류: {error_count}, 경고: {warning_count})")
     lines.append("")
 
-    # 규칙별 그룹핑
-    by_rule: dict[str, list[CheckResult]] = {}
-    for r in results:
-        by_rule.setdefault(r.rule, []).append(r)
+    if summary_only:
+        by_rule: dict[str, list[CheckResult]] = {}
+        for r in results:
+            by_rule.setdefault(r.rule, []).append(r)
+        for rule_name, rule_results in by_rule.items():
+            lines.append(f"  {rule_name}: {len(rule_results)}건")
+        lines.append("=" * 80)
+        return "\n".join(lines)
 
-    for rule_name, rule_results in by_rule.items():
-        lines.append(f"── {rule_name} ({len(rule_results)}건) ──")
-        if not summary_only:
-            for r in rule_results:
-                severity_mark = "[오류]" if r.severity == "error" else "[경고]"
-                location = _format_location(r)
-                lines.append(f"  {severity_mark} {location}: {r.message}")
-                lines.append(f"         >> {r.text}")
-        lines.append("")
+    # 표 데이터 준비
+    rows: list[tuple[str, str, str, str, str]] = []
+    for i, r in enumerate(results, 1):
+        no = str(i)
+        location = _format_location(r)
+        rule = r.rule
+        current, improved = _extract_current_improved(r)
+        severity = "오류" if r.severity == "error" else "경고"
+        rows.append((no, location, rule, current, improved))
 
-    lines.append("=" * 60)
+    # 열 너비 계산
+    headers = ("No", "위치", "검사항목", "현행", "개선")
+    col_widths = [_display_width(h) for h in headers]
+    for row in rows:
+        for j, cell in enumerate(row):
+            col_widths[j] = max(col_widths[j], _display_width(cell))
+
+    # 최소/최대 너비 조정
+    col_widths[0] = max(col_widths[0], 4)   # No
+    col_widths[1] = max(col_widths[1], 8)   # 위치
+    col_widths[2] = max(col_widths[2], 10)  # 검사항목
+    col_widths[3] = max(col_widths[3], 14)  # 현행
+    col_widths[4] = max(col_widths[4], 14)  # 개선
+
+    def format_row(cells: tuple[str, ...]) -> str:
+        parts = []
+        for j, cell in enumerate(cells):
+            parts.append(_pad(cell, col_widths[j]))
+        return "  " + " | ".join(parts)
+
+    # 구분선
+    sep = "  " + "-+-".join("-" * w for w in col_widths)
+
+    # 헤더
+    lines.append(format_row(headers))
+    lines.append(sep)
+
+    # 데이터 행
+    for row in rows:
+        lines.append(format_row(row))
+
+    lines.append(sep)
+    lines.append("=" * 80)
     return "\n".join(lines)
 
 

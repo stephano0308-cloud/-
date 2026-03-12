@@ -435,9 +435,8 @@ ALL_CHECKERS = [
     ("오탈자", check_typos),
     ("띄어쓰기 일관성", check_spacing_consistency),
     ("조항 형식", check_article_format),
+    ("숫자 표기", check_number_format),
     ("날짜 형식", check_date_format),
-    ("괄호 짝", check_brackets),
-    ("법령 인용", check_legal_citation),
 ]
 
 
