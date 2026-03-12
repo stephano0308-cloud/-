@@ -17,6 +17,28 @@ from hwpx_reader import read_hwpx_with_position, read_text_file_with_position, P
 from checkers import run_all_checks, ALL_CHECKERS, CheckResult
 
 
+def _select_file_dialog() -> str | None:
+    """파일 선택 대화상자를 열어 파일 경로를 반환한다."""
+    try:
+        import tkinter as tk
+        from tkinter import filedialog
+        root = tk.Tk()
+        root.withdraw()  # 메인 창 숨기기
+        root.attributes("-topmost", True)  # 대화상자를 최상위로
+        filepath = filedialog.askopenfilename(
+            title="검사할 파일을 선택하세요",
+            filetypes=[
+                ("HWPX 파일", "*.hwpx"),
+                ("텍스트 파일", "*.txt"),
+                ("모든 파일", "*.*"),
+            ],
+        )
+        root.destroy()
+        return filepath if filepath else None
+    except ImportError:
+        return None
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="HWPX 문서 맞춤법·형식 검사기",
@@ -36,7 +58,7 @@ def parse_args() -> argparse.Namespace:
   hwpx_checker 계약서.hwpx --json --output result.json
         """,
     )
-    parser.add_argument("file", help="검사할 파일 경로 (.hwpx 또는 .txt)")
+    parser.add_argument("file", nargs="?", default=None, help="검사할 파일 경로 (.hwpx 또는 .txt)")
     parser.add_argument(
         "--rules",
         nargs="+",
@@ -58,7 +80,18 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="요약만 출력 (상세 내역 생략)",
     )
-    return parser.parse_args()
+    args = parser.parse_args()
+
+    # 파일 인자가 없으면 파일 선택 대화상자를 띄운다
+    if args.file is None:
+        selected = _select_file_dialog()
+        if selected:
+            args.file = selected
+        else:
+            print("파일이 선택되지 않았습니다.", file=sys.stderr)
+            sys.exit(0)
+
+    return args
 
 
 def load_document(filepath: str) -> list[ParagraphInfo]:
@@ -181,8 +214,13 @@ def main():
         print(output)
 
     # 오류가 있으면 종료 코드 1
-    if any(r.severity == "error" for r in results):
-        sys.exit(1)
+    exit_code = 1 if any(r.severity == "error" for r in results) else 0
+
+    # exe로 직접 실행(더블클릭)한 경우 결과를 확인할 수 있도록 대기
+    if getattr(sys, "frozen", False):
+        input("\n종료하려면 Enter 키를 누르세요...")
+
+    sys.exit(exit_code)
 
 
 if __name__ == "__main__":
