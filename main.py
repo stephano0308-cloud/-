@@ -156,6 +156,9 @@ def format_text_report(results: list[CheckResult], filepath: str,
         lines.append("=" * 80)
         return "\n".join(lines)
 
+    # 오류를 경고보다 먼저 정렬
+    results = sorted(results, key=lambda r: (0 if r.severity == "error" else 1, r.paragraph))
+
     # 심각도별 카운트
     error_count = sum(1 for r in results if r.severity == "error")
     warning_count = sum(1 for r in results if r.severity == "warning")
@@ -172,18 +175,23 @@ def format_text_report(results: list[CheckResult], filepath: str,
         lines.append("=" * 80)
         return "\n".join(lines)
 
-    # 표 데이터 준비
-    rows: list[tuple[str, str, str, str, str]] = []
+    # 심각도 마커
+    _SEV_MARKER = {"error": "✗ 오류", "warning": "△ 경고"}
+
+    # 표 데이터 준비 (심각도 컬럼 추가)
+    rows: list[tuple[str, str, str, str, str, str]] = []
+    result_contexts: list[str] = []  # 문맥 텍스트
     for i, r in enumerate(results, 1):
         no = str(i)
+        severity = _SEV_MARKER.get(r.severity, r.severity)
         location = _format_location(r)
         rule = r.rule
         current, improved = _extract_current_improved(r)
-        severity = "오류" if r.severity == "error" else "경고"
-        rows.append((no, location, rule, current, improved))
+        rows.append((no, severity, location, rule, current, improved))
+        result_contexts.append(r.text)
 
     # 열 너비 계산
-    headers = ("No", "위치", "검사항목", "현행", "개선")
+    headers = ("No", "심각도", "위치", "검사항목", "현행", "개선")
     col_widths = [_display_width(h) for h in headers]
     for row in rows:
         for j, cell in enumerate(row):
@@ -191,10 +199,11 @@ def format_text_report(results: list[CheckResult], filepath: str,
 
     # 최소/최대 너비 조정
     col_widths[0] = max(col_widths[0], 4)   # No
-    col_widths[1] = max(col_widths[1], 8)   # 위치
-    col_widths[2] = max(col_widths[2], 10)  # 검사항목
-    col_widths[3] = max(col_widths[3], 14)  # 현행
-    col_widths[4] = max(col_widths[4], 14)  # 개선
+    col_widths[1] = max(col_widths[1], 8)   # 심각도
+    col_widths[2] = max(col_widths[2], 8)   # 위치
+    col_widths[3] = max(col_widths[3], 10)  # 검사항목
+    col_widths[4] = max(col_widths[4], 14)  # 현행
+    col_widths[5] = max(col_widths[5], 14)  # 개선
 
     def format_row(cells: tuple[str, ...]) -> str:
         parts = []
@@ -204,16 +213,33 @@ def format_text_report(results: list[CheckResult], filepath: str,
 
     # 구분선
     sep = "  " + "-+-".join("-" * w for w in col_widths)
+    # 굵은 구분선 (오류/경고 섹션 사이)
+    thick_sep = "  " + "=+=" .join("=" * w for w in col_widths)
 
     # 헤더
     lines.append(format_row(headers))
-    lines.append(sep)
+    lines.append(thick_sep)
 
     # 데이터 행
-    for row in rows:
+    prev_severity = None
+    for i, (row, ctx) in enumerate(zip(rows, result_contexts)):
+        cur_severity = results[i].severity
+        # 오류→경고 전환 시 굵은 구분선 삽입
+        if prev_severity == "error" and cur_severity == "warning":
+            lines.append(thick_sep)
+        elif i > 0:
+            lines.append(sep)
+
         lines.append(format_row(row))
 
-    lines.append(sep)
+        # 문맥 텍스트가 있으면 아래에 표시
+        if ctx:
+            ctx_label = f"     ↳ 문맥: {ctx}"
+            lines.append(ctx_label)
+
+        prev_severity = cur_severity
+
+    lines.append(thick_sep)
     lines.append("=" * 80)
     return "\n".join(lines)
 
