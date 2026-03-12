@@ -1,0 +1,624 @@
+"""HWPX 문서 검사 모듈 - 검사 규칙"""
+
+from __future__ import annotations
+
+import re
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from hwpx_reader import ParagraphInfo
+
+
+@dataclass
+class CheckResult:
+    """검사 결과 하나를 나타낸다."""
+    rule: str          # 검사 규칙 이름
+    severity: str      # error / warning
+    message: str       # 설명
+    paragraph: int     # 문단 번호 (1-based)
+    text: str          # 해당 문단 원문 (일부)
+    page: int = 0      # 페이지 번호 (1-based, 0=알 수 없음)
+    line: int = 0      # 줄 번호 (1-based, 0=알 수 없음)
+
+
+# ──────────────────────────────────────────────
+# 1. 오탈자 (흔한 한국어 오탈자 패턴)
+# ──────────────────────────────────────────────
+_COMMON_TYPOS: dict[str, str] = {
+    # ── 되다/돼다 혼동 ──
+    "됬": "됐",
+    "댔": "됐",
+    "됄": "될",
+    "안됀": "안 된",
+    "않되": "안 되",
+    "않돼": "안 돼",
+    "되어지다": "되다",
+    "되여": "되어",
+    "되어지는": "되는",
+    "되어지고": "되고",
+    "되어진": "된",
+    "되어져": "되어",
+
+    # ── 며칠/몇일 ──
+    "몇일": "며칠",
+    "몇 일": "며칠",
+
+    # ── 왠/웬 혼동 ──
+    "웬지": "왠지",
+    "왠만하": "웬만하",
+    "왠만큼": "웬만큼",
+    "왠일": "웬일",
+
+    # ── 어이/어의 ──
+    "어의없": "어이없",
+    "어의가 없": "어이가 없",
+
+    # ── 부사 -이/-히 혼동 ──
+    "일일히": "일일이",
+    "깨끗히": "깨끗이",
+    "간간히": "간간이",
+    "뜻깊히": "뜻깊이",
+    "깊숙히": "깊숙이",
+    "반듯히": "반듯이",
+    "가까히": "가까이",
+    "대단히": "대단히",  # 올바름 — 검사 제외
+    "번번히": "번번이",
+    "틈틈히": "틈틈이",
+    "다달히": "다달이",
+    "곳곳히": "곳곳이",
+
+    # ── 사이시옷 오류 ──
+    "갯수": "개수",
+    "댓가": "대가",
+    "숫자": "숫자",  # 올바름
+    "곳간": "곳간",  # 올바름
+    "셋방": "셋방",  # 올바름
+
+    # ── 자주 틀리는 맞춤법 ──
+    "금새": "금세",
+    "희안하": "희한하",
+    "바램": "바람",
+    "설레임": "설렘",
+    "핼쑥": "핼쓱",
+    "오랫만": "오랜만",
+    "문안하": "문안하",  # 올바름
+
+    # ── 겹받침 탈락 ──
+    "하겟": "하겠",
+    "잇다": "있다",
+    "엇다": "없다",
+
+    # ── 기타 빈출 오탈자 ──
+    "역활": "역할",
+    "할께": "할게",
+    "할껄": "할걸",
+    "내노라": "내로라",
+    "메꾸다": "메우다",
+    "벌려놓": "벌여놓",
+    "아니오": "아니요",
+    "마추다": "맞추다",
+    "마춤": "맞춤",
+    "어떠케": "어떻게",
+    "어떡게": "어떻게",
+    "남녀로소": "남녀노소",
+    "곤난": "곤란",
+
+    # ── 자판 입력 실수 (초성/중성/종성 오타) ──
+    # ㅎ/ㅗ 위치 실수 (ㅎ과 ㅗ가 같은 키)
+    "호가인": "확인",
+    "호가ㅇ인": "확인",
+    "혹인": "확인",
+    "학인": "확인",
+    "확ㅇ니": "확인",
+    # ㄱ/ㅏ 위치 실수
+    "가격겨": "가격이",
+    # 쌍자음 실수
+    "검토토": "검토",
+    "접수수": "접수",
+    # 초성 인접키 오타 (ㅂ↔ㅈ, ㄷ↔ㅎ, ㅅ↔ㄹ 등)
+    "게약": "계약",
+    "게약서": "계약서",
+    "겨약": "계약",
+    "겨약서": "계약서",
+    "규젱": "규정",
+    "규졍": "규정",
+    "긔정": "규정",
+    "조하": "조회",
+    "조해": "조회",
+    "싱행": "시행",
+    "시헹": "시행",
+    "처리리": "처리",
+    "검토오": "검토",
+    "보거서": "보고서",
+    "보고ㅅ서": "보고서",
+    "보곶서": "보고서",
+    "결졍": "결정",
+    "결젼": "결정",
+    "걀정": "결정",
+    "신쳥": "신청",
+    "신첳": "신청",
+    "싱청": "신청",
+    "승인ㄴ": "승인",
+    "승ㅇ인": "승인",
+    "싱인": "승인",
+    "자료료": "자료",
+    "제충": "제출",
+    "제풀": "제출",
+    "게시시": "게시",
+    "통비": "통보",
+    "통ㅂ보": "통보",
+    "톡보": "통보",
+    "납부부": "납부",
+    "남부": "납부",
+    "기가간": "기간",
+    "기갖": "기간",
+    "이행행": "이행",
+    "삼사": "심사",
+    "심싸": "심사",
+    "진행행": "진행",
+    "진햄": "진행",
+    "담당당": "담당",
+    "담딩": "담당",
+    "협의의": "협의",
+    "혐의": "혐의",  # 올바름 (범죄 혐의)
+    "변겨": "변경",
+    "변걍": "변경",
+    "뱐경": "변경",
+    "조쳥": "조정",
+    "조졍": "조정",
+    "판딘": "판단",
+    "판딘하": "판단하",
+    "판달": "판단",
+    "해당당": "해당",
+    "내요": "내용",
+    "내룡": "내용",
+    "내뇽": "내용",
+    "사하": "사항",
+    "사향": "사항",
+    "사핳": "사항",
+    "검증증": "검증",
+    "평까": "평가",
+    "평갸": "평가",
+    "분넉": "분석",
+    "붅석": "분석",
+    "관련련": "관련",
+    "괄련": "관련",
+    "필료": "필요",
+    "핑요": "필요",
+    "의겨": "의견",
+    "의결ㄴ": "의견",
+    "의경": "의견",
+    "회으": "회의",
+    "회이": "회의",
+    "검사사": "검사",
+    "감사사": "감사",
+    "서류류": "서류",
+    "설명명": "설명",
+    "지적적": "지적",
+}
+
+# 오탈자 검사에서 제외할 패턴
+_TYPO_EXCEPTIONS = {
+    "오랫동안",  # "오랫만" 검사 시 오탈자로 잡히지 않도록
+    "잇다르",    # "잇다" 검사 시 "잇다르다" 제외
+    "잇달",      # "잇달아" 등 올바른 표현
+}
+
+
+def check_typos(paragraphs: list[str]) -> list[CheckResult]:
+    """흔한 한국어 오탈자 패턴을 검사한다."""
+    results = []
+    # 긴 패턴 우선 매칭을 위해 길이 내림차순 정렬
+    sorted_typos = sorted(
+        ((w, c) for w, c in _COMMON_TYPOS.items() if w != c),
+        key=lambda x: len(x[0]),
+        reverse=True,
+    )
+    for idx, para in enumerate(paragraphs, 1):
+        # 이미 감지된 위치를 추적하여 중복 방지
+        matched_ranges: list[tuple[int, int]] = []
+        for wrong, correct in sorted_typos:
+            positions = [m.start() for m in re.finditer(re.escape(wrong), para)]
+            for pos in positions:
+                end = pos + len(wrong)
+                # 이미 더 긴 패턴으로 감지된 범위와 겹치면 건너뜀
+                if any(ms <= pos < me or ms < end <= me for ms, me in matched_ranges):
+                    continue
+                # 예외 확인
+                context = para[max(0, pos - 5):end + 5]
+                if any(exc in context for exc in _TYPO_EXCEPTIONS):
+                    continue
+                matched_ranges.append((pos, end))
+                results.append(CheckResult(
+                    rule="오탈자",
+                    severity="error",
+                    message=f"'{wrong}' → '{correct}'",
+                    paragraph=idx,
+                    text=_snippet(para, pos, len(wrong)),
+                ))
+    return results
+
+
+# ──────────────────────────────────────────────
+# 2. 띄어쓰기 일관성 검사
+# ──────────────────────────────────────────────
+# 같은 단어가 다르게 띄어쓰기되는 경우만 체크
+def check_spacing_consistency(paragraphs: list[str]) -> list[CheckResult]:
+    """같은 단어가 다르게 띄어쓰기된 경우만 검사한다.
+
+    예: '세무조사 기간연장통지서' vs '세무조사기간연장통지서'
+    """
+    results = []
+
+    # 1단계: 모든 한글 어절(단어)을 추출하여 n-gram 생성
+    # 각 문단에서 연속된 한글 단어 2~6개의 조합을 만듦
+    # spacing_variants: {정규화된문자열: [(문단번호, 위치, 원본형태), ...]}
+    spacing_variants: dict[str, list[tuple[int, int, str]]] = {}
+
+    for idx, para in enumerate(paragraphs, 1):
+        # 한글 어절 위치 추출
+        words = list(re.finditer(r"[가-힣]+", para))
+
+        # 연속 단어 n-gram (2~6개 조합)
+        for n in range(2, min(7, len(words) + 1)):
+            for i in range(len(words) - n + 1):
+                group = words[i:i + n]
+                start = group[0].start()
+                end = group[-1].end()
+                phrase = para[start:end]
+                normalized = phrase.replace(" ", "")
+
+                if len(normalized) < 4:  # 4글자 미만은 무시
+                    continue
+
+                if normalized not in spacing_variants:
+                    spacing_variants[normalized] = []
+                spacing_variants[normalized].append((idx, start, phrase))
+
+    # 2단계: 같은 정규화 문자열에 서로 다른 형태가 있으면 경고
+    reported: set[tuple[int, int]] = set()  # (문단, 위치) 중복 방지
+    for normalized, variants in spacing_variants.items():
+        unique_forms = set(v[2] for v in variants)
+        if len(unique_forms) <= 1:
+            continue
+
+        forms = list(unique_forms)
+        for para_idx, pos, phrase in variants:
+            key = (para_idx, pos)
+            if key in reported:
+                continue
+            reported.add(key)
+            other_forms = [f for f in forms if f != phrase]
+            results.append(CheckResult(
+                rule="띄어쓰기 일관성",
+                severity="warning",
+                message=f"'{phrase}' — 문서 내 다른 표기: {', '.join(other_forms)}",
+                paragraph=para_idx,
+                text=_snippet(paragraphs[para_idx - 1], pos, len(phrase)),
+            ))
+
+    return results
+
+
+# ──────────────────────────────────────────────
+# 3. 제○조 / 제○항 형식 검사
+# ──────────────────────────────────────────────
+# 올바른 형식: "제1조", "제2항", "제3호" (제+숫자+단위 붙여쓰기)
+# 올바른 띄어쓰기: "제1조 제2항 제3호" (조/항/호 사이는 띄어쓰기)
+
+# "제 1 조", "제 2항" 등 제와 숫자 사이에 공백이 있는 경우
+_ARTICLE_SPACE_PATTERN = re.compile(r"제\s+(\d+)\s*(조|항|호)|제(\d+)\s+(조|항|호)")
+
+
+def check_article_format(paragraphs: list[str]) -> list[CheckResult]:
+    """'제○조/항/호' 형식이 올바른지 검사한다."""
+    results = []
+    for idx, para in enumerate(paragraphs, 1):
+        # "제 1조", "제 1 조", "제1 조" 등 내부 공백 오류
+        for m in _ARTICLE_SPACE_PATTERN.finditer(para):
+            matched = m.group()
+            clean = re.sub(r"\s+", "", matched)
+            results.append(CheckResult(
+                rule="조항 형식",
+                severity="error",
+                message=f"'{matched}' → '{clean}' (공백 제거)",
+                paragraph=idx,
+                text=_snippet(para, m.start(), len(matched)),
+            ))
+
+        # 조항호 붙여쓰기 오류: "제1조제2항" → "제1조 제2항"
+        for m in re.finditer(r"제(\d+)(조|항|호)(제\d+(?:조|항|호))", para):
+            matched = m.group()
+            corrected = f"제{m.group(1)}{m.group(2)} {m.group(3)}"
+            results.append(CheckResult(
+                rule="조항 형식",
+                severity="error",
+                message=f"'{matched}' → '{corrected}' (조/항/호 사이 띄어쓰기)",
+                paragraph=idx,
+                text=_snippet(para, m.start(), len(matched)),
+            ))
+
+        # 한글 숫자로 쓴 경우 검사 ("제일조", "제이항" 등)
+        for m in re.finditer(r"제([일이삼사오육칠팔구십백천]+)(조|항|호)", para):
+            results.append(CheckResult(
+                rule="조항 형식",
+                severity="warning",
+                message=f"'{m.group()}' — 아라비아 숫자 사용 권장 (예: 제1조)",
+                paragraph=idx,
+                text=_snippet(para, m.start(), len(m.group())),
+            ))
+    return results
+
+
+# ──────────────────────────────────────────────
+# 4. 숫자 표기 오류
+# ──────────────────────────────────────────────
+def check_number_format(paragraphs: list[str]) -> list[CheckResult]:
+    """숫자 표기 오류를 검사한다."""
+    results = []
+    for idx, para in enumerate(paragraphs, 1):
+        # 4자리 이상 숫자에 쉼표 없는 경우 (금액 등)
+        for m in re.finditer(r"(?<![.,\d])(\d{4,})(?![.,\d])", para):
+            num_str = m.group(1)
+            # 연도(19xx, 20xx)나 조항 번호는 제외
+            if re.match(r"^(19|20)\d{2}$", num_str):
+                continue
+            # 제N조 등 법조문 번호 뒤 숫자 제외
+            before = para[max(0, m.start() - 2):m.start()]
+            if re.search(r"제$", before):
+                continue
+            num = int(num_str)
+            if num >= 10000:
+                formatted = f"{num:,}"
+                results.append(CheckResult(
+                    rule="숫자 표기",
+                    severity="warning",
+                    message=f"'{num_str}' → '{formatted}' (천 단위 쉼표 권장)",
+                    paragraph=idx,
+                    text=_snippet(para, m.start(), len(num_str)),
+                ))
+
+        # 단위와 숫자 사이 띄어쓰기 검사 (예: "100만원" → "100만 원")
+        for m in re.finditer(r"(\d+)(만|억|조)\s*(원|달러|엔|위안)", para):
+            full = m.group()
+            if " " not in full[len(m.group(1)):]:
+                # "원" 앞에 공백이 없는 경우
+                corrected = f"{m.group(1)}{m.group(2)} {m.group(3)}"
+                if corrected != full:
+                    results.append(CheckResult(
+                        rule="숫자 표기",
+                        severity="warning",
+                        message=f"'{full}' → '{corrected}' (단위 띄어쓰기)",
+                        paragraph=idx,
+                        text=_snippet(para, m.start(), len(full)),
+                    ))
+    return results
+
+
+# ──────────────────────────────────────────────
+# 5. 날짜 형식 오류
+# ──────────────────────────────────────────────
+_DATE_PATTERNS = [
+    # YYYY.MM.DD or YYYY-MM-DD or YYYY/MM/DD
+    re.compile(r"(\d{4})[.\-/](\d{1,2})[.\-/](\d{1,2})"),
+    # YYYY년 MM월 DD일
+    re.compile(r"(\d{4})\s*년\s*(\d{1,2})\s*월\s*(\d{1,2})\s*일"),
+]
+
+
+def check_date_format(paragraphs: list[str]) -> list[CheckResult]:
+    """날짜 형식 오류를 검사한다."""
+    results = []
+    for idx, para in enumerate(paragraphs, 1):
+        for pat in _DATE_PATTERNS:
+            for m in pat.finditer(para):
+                year, month, day = int(m.group(1)), int(m.group(2)), int(m.group(3))
+                errors = []
+                if month < 1 or month > 12:
+                    errors.append(f"월({month})이 유효하지 않음")
+                if day < 1 or day > 31:
+                    errors.append(f"일({day})이 유효하지 않음")
+                if month in (4, 6, 9, 11) and day > 30:
+                    errors.append(f"{month}월은 30일까지")
+                if month == 2 and day > 29:
+                    errors.append(f"2월은 29일까지")
+                if year < 1900 or year > 2100:
+                    errors.append(f"연도({year})가 유효 범위 밖")
+
+                for err in errors:
+                    results.append(CheckResult(
+                        rule="날짜 형식",
+                        severity="error",
+                        message=f"'{m.group()}' — {err}",
+                        paragraph=idx,
+                        text=_snippet(para, m.start(), len(m.group())),
+                    ))
+
+        # 날짜 구분자 혼용 검사 (예: 2024.01-15)
+        for m in re.finditer(r"\d{4}([.\-/])\d{1,2}([.\-/])\d{1,2}", para):
+            if m.group(1) != m.group(2):
+                results.append(CheckResult(
+                    rule="날짜 형식",
+                    severity="warning",
+                    message=f"'{m.group()}' — 날짜 구분자가 통일되지 않음",
+                    paragraph=idx,
+                    text=_snippet(para, m.start(), len(m.group())),
+                ))
+    return results
+
+
+# ──────────────────────────────────────────────
+# 6. 괄호 짝 오류
+# ──────────────────────────────────────────────
+_BRACKET_PAIRS = {
+    "(": ")", ")": "(",
+    "[": "]", "]": "[",
+    "{": "}", "}": "{",
+    "「": "」", "」": "「",
+    "『": "』", "』": "『",
+    "【": "】", "】": "【",
+    "〈": "〉", "〉": "〈",
+    "《": "》", "》": "《",
+}
+_OPEN_BRACKETS = set("([{「『【〈《")
+_CLOSE_BRACKETS = set(")]}」』】〉》")
+
+
+def check_brackets(paragraphs: list[str]) -> list[CheckResult]:
+    """괄호 짝이 맞는지 검사한다."""
+    results = []
+    # 전체 텍스트에 대해 검사 (문단 단위로는 의미 없을 수 있음)
+    full_text = "\n".join(paragraphs)
+    para_offsets = []
+    offset = 0
+    for p in paragraphs:
+        para_offsets.append(offset)
+        offset += len(p) + 1  # +1 for \n
+
+    stack: list[tuple[str, int]] = []  # (bracket, position)
+    for i, ch in enumerate(full_text):
+        if ch in _OPEN_BRACKETS:
+            stack.append((ch, i))
+        elif ch in _CLOSE_BRACKETS:
+            expected_open = _BRACKET_PAIRS[ch]
+            if stack and stack[-1][0] == expected_open:
+                stack.pop()
+            else:
+                para_num = _pos_to_para(i, para_offsets)
+                results.append(CheckResult(
+                    rule="괄호 짝",
+                    severity="error",
+                    message=f"닫는 괄호 '{ch}'에 대응하는 여는 괄호 '{expected_open}'가 없음",
+                    paragraph=para_num,
+                    text=_snippet(full_text, i, 1),
+                ))
+
+    for bracket, pos in stack:
+        expected_close = _BRACKET_PAIRS[bracket]
+        para_num = _pos_to_para(pos, para_offsets)
+        results.append(CheckResult(
+            rule="괄호 짝",
+            severity="error",
+            message=f"여는 괄호 '{bracket}'에 대응하는 닫는 괄호 '{expected_close}'가 없음",
+            paragraph=para_num,
+            text=_snippet(full_text, pos, 1),
+        ))
+    return results
+
+
+# ──────────────────────────────────────────────
+# 7. 법령 인용 형식 검사
+# ──────────────────────────────────────────────
+# 올바른 법령 인용 형식 예:
+#   「민법」 제1조
+#   「형사소송법」 제200조의2
+#   같은 법 제10조제1항
+_LAW_CITE_PATTERNS = [
+    # 법령명을 「」 없이 인용한 경우 (형법, 민법 등 모든 법령명)
+    (
+        re.compile(
+            r"(?<![「])("
+            r"[가-힣]+법|[가-힣]+령|[가-힣]+규칙|[가-힣]+조례"
+            r")(?![」])\s*제\d+"
+        ),
+        "법령명은 「」(낫표)로 감싸야 합니다",
+        "warning",
+    ),
+    # 「법령명」과 제N조 사이 공백 누락
+    (
+        re.compile(r"「[^」]+」제(\d+)"),
+        "법령명 뒤에 공백을 추가하세요 (예: 「민법」 제1조)",
+        "warning",
+    ),
+    # "동법", "동조" 사용 (지양 표현)
+    (
+        re.compile(r"동(법|조|항|호)"),
+        "'동법/동조/동항/동호' 대신 '같은 법/같은 조/같은 항/같은 호'로 작성 권장",
+        "warning",
+    ),
+    # (제1조 제1항 형식은 올바른 띄어쓰기 — 조항 형식 검사에서 처리)
+]
+
+
+def check_legal_citation(paragraphs: list[str]) -> list[CheckResult]:
+    """법령 인용 형식을 검사한다."""
+    results = []
+    for idx, para in enumerate(paragraphs, 1):
+        for pattern, message, severity in _LAW_CITE_PATTERNS:
+            for m in pattern.finditer(para):
+                results.append(CheckResult(
+                    rule="법령 인용",
+                    severity=severity,
+                    message=f"'{m.group()}' — {message}",
+                    paragraph=idx,
+                    text=_snippet(para, m.start(), len(m.group())),
+                ))
+    return results
+
+
+# ──────────────────────────────────────────────
+# 전체 검사 실행
+# ──────────────────────────────────────────────
+ALL_CHECKERS = [
+    ("오탈자", check_typos),
+    ("띄어쓰기 일관성", check_spacing_consistency),
+    ("조항 형식", check_article_format),
+    ("숫자 표기", check_number_format),
+    ("날짜 형식", check_date_format),
+]
+
+
+def run_all_checks(paragraphs: list[str],
+                   enabled: list[str] | None = None,
+                   para_infos: list[ParagraphInfo] | None = None,
+                   ) -> list[CheckResult]:
+    """모든 검사를 실행하고 결과를 반환한다.
+
+    Args:
+        paragraphs: 검사할 문단 리스트
+        enabled: 실행할 검사 이름 리스트. None이면 전체 실행.
+        para_infos: ParagraphInfo 리스트 (페이지/줄 정보 포함). 있으면 결과에 반영.
+    """
+    results = []
+    for name, checker in ALL_CHECKERS:
+        if enabled and name not in enabled:
+            continue
+        results.extend(checker(paragraphs))
+
+    # para_infos가 있으면 결과에 페이지/줄 정보를 채운다
+    if para_infos:
+        _fill_position_info(results, para_infos)
+
+    return results
+
+
+def _fill_position_info(results: list[CheckResult],
+                        para_infos: list[ParagraphInfo]) -> None:
+    """CheckResult에 페이지/줄 정보를 채운다."""
+    for r in results:
+        idx = r.paragraph - 1  # 0-based
+        if 0 <= idx < len(para_infos):
+            info = para_infos[idx]
+            r.page = info.page
+            r.line = info.line
+
+
+# ──────────────────────────────────────────────
+# 유틸리티
+# ──────────────────────────────────────────────
+def _snippet(text: str, pos: int, length: int, context: int = 20) -> str:
+    """해당 위치 주변 텍스트를 잘라 반환한다."""
+    start = max(0, pos - context)
+    end = min(len(text), pos + length + context)
+    prefix = "..." if start > 0 else ""
+    suffix = "..." if end < len(text) else ""
+    return prefix + text[start:end] + suffix
+
+
+def _pos_to_para(pos: int, para_offsets: list[int]) -> int:
+    """전체 텍스트 내 위치를 문단 번호(1-based)로 변환한다."""
+    for i in range(len(para_offsets) - 1, -1, -1):
+        if pos >= para_offsets[i]:
+            return i + 1
+    return 1
