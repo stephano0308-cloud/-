@@ -176,34 +176,40 @@ def check_spacing_consistency(paragraphs: list[str]) -> list[CheckResult]:
 # ──────────────────────────────────────────────
 # 3. 제○조 / 제○항 형식 검사
 # ──────────────────────────────────────────────
-_ARTICLE_PATTERN = re.compile(
-    r"제\s*(\d+)\s*조"
-    r"|제\s*(\d+)\s*항"
-    r"|제\s*(\d+)\s*호"
-)
+# 올바른 형식: "제1조", "제2항", "제3호" (제+숫자+단위 붙여쓰기)
+# 올바른 띄어쓰기: "제1조 제2항 제3호" (조/항/호 사이는 띄어쓰기)
 
-# 올바른 형식: "제1조", "제2항", "제3호" (숫자 앞뒤에 공백 없음)
-_ARTICLE_STRICT = re.compile(r"제(\d+)(조|항|호)")
+# "제 1 조", "제 2항" 등 제와 숫자 사이에 공백이 있는 경우
+_ARTICLE_SPACE_PATTERN = re.compile(r"제\s+(\d+)\s*(조|항|호)|제(\d+)\s+(조|항|호)")
 
 
 def check_article_format(paragraphs: list[str]) -> list[CheckResult]:
     """'제○조/항/호' 형식이 올바른지 검사한다."""
     results = []
     for idx, para in enumerate(paragraphs, 1):
-        for m in _ARTICLE_PATTERN.finditer(para):
+        # "제 1조", "제 1 조", "제1 조" 등 내부 공백 오류
+        for m in _ARTICLE_SPACE_PATTERN.finditer(para):
             matched = m.group()
-            # 숫자와 조/항/호 사이 또는 '제'와 숫자 사이에 공백이 있으면 오류
-            if not _ARTICLE_STRICT.match(matched.replace(" ", "")):
-                continue  # 파싱 실패
-            if " " in matched:
-                clean = matched.replace(" ", "")
-                results.append(CheckResult(
-                    rule="조항 형식",
-                    severity="error",
-                    message=f"'{matched}' → '{clean}' (공백 제거)",
-                    paragraph=idx,
-                    text=_snippet(para, m.start(), len(matched)),
-                ))
+            clean = re.sub(r"\s+", "", matched)
+            results.append(CheckResult(
+                rule="조항 형식",
+                severity="error",
+                message=f"'{matched}' → '{clean}' (공백 제거)",
+                paragraph=idx,
+                text=_snippet(para, m.start(), len(matched)),
+            ))
+
+        # 조항호 붙여쓰기 오류: "제1조제2항" → "제1조 제2항"
+        for m in re.finditer(r"제(\d+)(조|항|호)(제\d+(?:조|항|호))", para):
+            matched = m.group()
+            corrected = f"제{m.group(1)}{m.group(2)} {m.group(3)}"
+            results.append(CheckResult(
+                rule="조항 형식",
+                severity="error",
+                message=f"'{matched}' → '{corrected}' (조/항/호 사이 띄어쓰기)",
+                paragraph=idx,
+                text=_snippet(para, m.start(), len(matched)),
+            ))
 
         # 한글 숫자로 쓴 경우 검사 ("제일조", "제이항" 등)
         for m in re.finditer(r"제([일이삼사오육칠팔구십백천]+)(조|항|호)", para):
