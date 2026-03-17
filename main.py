@@ -248,31 +248,94 @@ def _wait_before_exit():
         input("종료하려면 Enter 키를 누르세요...")
 
 
+def _open_file_dialog() -> list[str]:
+    """tkinter 파일 선택 다이얼로그를 열어 HWPX 파일 경로를 반환한다."""
+    try:
+        import tkinter as tk
+        from tkinter import filedialog
+
+        root = tk.Tk()
+        root.withdraw()
+        root.attributes("-topmost", True)
+        root.update()
+
+        file_paths = filedialog.askopenfilenames(
+            title="검수할 HWPX 파일 선택 (여러 파일 선택 가능)",
+            filetypes=[
+                ("HWPX 파일", "*.hwpx"),
+                ("모든 파일", "*.*"),
+            ],
+        )
+        root.destroy()
+        return list(file_paths)
+    except Exception as e:
+        logger.warning("파일 선택 다이얼로그를 열 수 없습니다: %s", e)
+        return []
+
+
+def _save_file_dialog(title: str, default_ext: str, filetypes: list) -> str:
+    """tkinter 저장 다이얼로그를 열어 저장 경로를 반환한다."""
+    try:
+        import tkinter as tk
+        from tkinter import filedialog
+
+        root = tk.Tk()
+        root.withdraw()
+        root.attributes("-topmost", True)
+        root.update()
+
+        file_path = filedialog.asksaveasfilename(
+            title=title,
+            defaultextension=default_ext,
+            filetypes=filetypes,
+        )
+        root.destroy()
+        return file_path or ""
+    except Exception:
+        return ""
+
+
 def _interactive_mode() -> int:
     """인자 없이 exe를 실행했을 때 대화형 모드로 동작한다."""
     print("=" * 60)
     print("  HWPX 문서 일관성 검수 도구")
     print("=" * 60)
     print()
-    print("검수할 HWPX 파일 또는 폴더를 드래그하거나 경로를 입력하세요.")
-    print("(여러 파일은 쉼표로 구분, 빈 입력 시 종료)")
-    print()
 
     while True:
-        raw = input("경로 입력> ").strip().strip('"').strip("'")
-        if not raw:
+        print("[1] 파일 선택 (탐색기)")
+        print("[2] 경로 직접 입력")
+        print("[Q] 종료")
+        print()
+        choice = input("선택> ").strip().lower()
+
+        if choice in ("q", ""):
             print("종료합니다.")
             return 0
 
-        # 쉼표 또는 세미콜론으로 여러 경로 지정 가능
-        paths = [p.strip().strip('"').strip("'") for p in raw.replace(";", ",").split(",") if p.strip()]
-
         all_files: list[str] = []
-        for p in paths:
-            all_files.extend(collect_hwpx_files(p, recursive=True))
+
+        if choice == "1":
+            print("파일 선택 창을 여는 중...")
+            selected = _open_file_dialog()
+            if not selected:
+                print("파일이 선택되지 않았습니다.\n")
+                continue
+            for p in selected:
+                all_files.extend(collect_hwpx_files(p, recursive=True))
+        elif choice == "2":
+            raw = input("경로 입력 (여러 파일은 쉼표 구분)> ").strip().strip('"').strip("'")
+            if not raw:
+                continue
+            paths = [p.strip().strip('"').strip("'") for p in raw.replace(";", ",").split(",") if p.strip()]
+            for p in paths:
+                all_files.extend(collect_hwpx_files(p, recursive=True))
+        else:
+            print("잘못된 입력입니다.\n")
+            continue
 
         if not all_files:
-            print("HWPX 파일을 찾을 수 없습니다. 다시 입력해주세요.\n")
+            print("HWPX 파일을 찾을 수 없습니다. 다시 시도해주세요.\n")
             continue
 
         print(f"\n{len(all_files)}개 파일 검수를 시작합니다...\n")
@@ -298,19 +361,36 @@ def _interactive_mode() -> int:
         else:
             print(f"전체 결과: {len(all_files)}개 파일 검수 완료, 이슈 없음")
 
-        # 결과 저장 여부 확인
+        # 결과 저장
         print()
-        save_input = input("결과를 JSON으로 저장하시겠습니까? (저장할 경로 입력, 건너뛰려면 Enter)> ").strip().strip('"')
-        if save_input:
-            save_json(all_issues, save_input, source_file=", ".join(all_files))
-            print(f"JSON 저장 완료: {save_input}")
+        print("[1] JSON으로 저장  [2] CSV로 저장  [3] 둘 다 저장  [Enter] 건너뛰기")
+        save_choice = input("저장 선택> ").strip()
 
-        save_input = input("결과를 CSV로 저장하시겠습니까? (저장할 경로 입력, 건너뛰려면 Enter)> ").strip().strip('"')
-        if save_input:
-            save_csv(all_issues, save_input, source_file=", ".join(all_files))
-            print(f"CSV 저장 완료: {save_input}")
+        if save_choice in ("1", "3"):
+            json_path = _save_file_dialog(
+                "JSON 결과 저장",
+                ".json",
+                [("JSON 파일", "*.json"), ("모든 파일", "*.*")],
+            )
+            if not json_path:
+                json_path = input("JSON 저장 경로 입력> ").strip().strip('"')
+            if json_path:
+                save_json(all_issues, json_path, source_file=", ".join(all_files))
+                print(f"JSON 저장 완료: {json_path}")
 
-        print("\n다른 파일을 검수하려면 경로를 입력하세요. (종료: 빈 입력)\n")
+        if save_choice in ("2", "3"):
+            csv_path = _save_file_dialog(
+                "CSV 결과 저장",
+                ".csv",
+                [("CSV 파일", "*.csv"), ("모든 파일", "*.*")],
+            )
+            if not csv_path:
+                csv_path = input("CSV 저장 경로 입력> ").strip().strip('"')
+            if csv_path:
+                save_csv(all_issues, csv_path, source_file=", ".join(all_files))
+                print(f"CSV 저장 완료: {csv_path}")
+
+        print("\n" + "-" * 60 + "\n")
 
 
 def main() -> int:
