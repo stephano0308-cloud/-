@@ -224,19 +224,126 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _is_frozen() -> bool:
+    """PyInstaller로 빌드된 exe에서 실행 중인지 확인한다."""
+    return getattr(sys, "frozen", False)
+
+
+def _get_bundled_rules_path() -> str | None:
+    """exe 번들에 포함된 rules.json 경로를 반환한다."""
+    if _is_frozen():
+        base = sys._MEIPASS
+    else:
+        base = os.path.dirname(os.path.abspath(__file__))
+    candidate = os.path.join(base, "rules.json")
+    if os.path.isfile(candidate):
+        return candidate
+    return None
+
+
+def _wait_before_exit():
+    """exe 실행 시 창이 바로 닫히지 않도록 사용자 입력을 대기한다."""
+    if _is_frozen():
+        print()
+        input("종료하려면 Enter 키를 누르세요...")
+
+
+def _interactive_mode() -> int:
+    """인자 없이 exe를 실행했을 때 대화형 모드로 동작한다."""
+    print("=" * 60)
+    print("  HWPX 문서 일관성 검수 도구")
+    print("=" * 60)
+    print()
+    print("검수할 HWPX 파일 또는 폴더를 드래그하거나 경로를 입력하세요.")
+    print("(여러 파일은 쉼표로 구분, 빈 입력 시 종료)")
+    print()
+
+    while True:
+        raw = input("경로 입력> ").strip().strip('"').strip("'")
+        if not raw:
+            print("종료합니다.")
+            return 0
+
+        # 쉼표 또는 세미콜론으로 여러 경로 지정 가능
+        paths = [p.strip().strip('"').strip("'") for p in raw.replace(";", ",").split(",") if p.strip()]
+
+        all_files: list[str] = []
+        for p in paths:
+            all_files.extend(collect_hwpx_files(p, recursive=True))
+
+        if not all_files:
+            print("HWPX 파일을 찾을 수 없습니다. 다시 입력해주세요.\n")
+            continue
+
+        print(f"\n{len(all_files)}개 파일 검수를 시작합니다...\n")
+
+        rules_path = _get_bundled_rules_path()
+        all_issues: list = []
+
+        for file_path in all_files:
+            try:
+                issues = process_single_file(
+                    file_path=file_path,
+                    include_table=True,
+                    rules_path=rules_path,
+                )
+                all_issues.extend(issues)
+                print_console_report(issues, source_file=file_path)
+            except Exception as e:
+                logger.error("파일 처리 중 오류 발생 (%s): %s", file_path, e)
+
+        total = len(all_issues)
+        if total > 0:
+            print(f"전체 결과: {len(all_files)}개 파일에서 총 {total}개 이슈 발견")
+        else:
+            print(f"전체 결과: {len(all_files)}개 파일 검수 완료, 이슈 없음")
+
+        # 결과 저장 여부 확인
+        print()
+        save_input = input("결과를 JSON으로 저장하시겠습니까? (저장할 경로 입력, 건너뛰려면 Enter)> ").strip().strip('"')
+        if save_input:
+            save_json(all_issues, save_input, source_file=", ".join(all_files))
+            print(f"JSON 저장 완료: {save_input}")
+
+        save_input = input("결과를 CSV로 저장하시겠습니까? (저장할 경로 입력, 건너뛰려면 Enter)> ").strip().strip('"')
+        if save_input:
+            save_csv(all_issues, save_input, source_file=", ".join(all_files))
+            print(f"CSV 저장 완료: {save_input}")
+
+        print("\n다른 파일을 검수하려면 경로를 입력하세요. (종료: 빈 입력)\n")
+
+
 def main() -> int:
     """메인 진입점."""
+    setup_logging()
+
+    # exe 더블클릭 등 인자 없이 실행된 경우 대화형 모드
+    if len(sys.argv) <= 1 and _is_frozen():
+        try:
+            return _interactive_mode()
+        except (KeyboardInterrupt, EOFError):
+            print("\n종료합니다.")
+            return 0
+
     parser = build_parser()
     args = parser.parse_args()
 
     setup_logging(verbose=getattr(args, "verbose", False))
 
     if not args.command:
+        # exe인데 인자가 잘못된 경우
+        if _is_frozen():
+            try:
+                return _interactive_mode()
+            except (KeyboardInterrupt, EOFError):
+                return 0
         parser.print_help()
         return 1
 
     if args.command == "check":
-        return cmd_check(args)
+        result = cmd_check(args)
+        _wait_before_exit()
+        return result
 
     parser.print_help()
     return 1
