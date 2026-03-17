@@ -1,0 +1,555 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>AI 저평가 주식 레이더</title>
+  <script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+  <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;700&family=Noto+Sans+KR:wght@300;400;500;700&display=swap" rel="stylesheet" />
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    @keyframes fadeSlideIn {
+      from { opacity: 0; transform: translateY(16px); }
+      to { opacity: 1; transform: translateY(0); }
+    }
+    @keyframes fadeIn { from { opacity: 0; } to { opacity: 1; } }
+    @keyframes pulse {
+      0%, 100% { opacity: 1; }
+      50% { opacity: 0.4; }
+    }
+    @keyframes spin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }
+    ::-webkit-scrollbar { width: 4px; }
+    ::-webkit-scrollbar-track { background: rgba(255,255,255,0.02); }
+    ::-webkit-scrollbar-thumb { background: rgba(0,255,136,0.3); border-radius: 2px; }
+    body { background: #090c14; }
+  </style>
+</head>
+<body>
+  <div id="root"></div>
+
+  <script type="text/babel">
+    const { useState, useEffect, useRef } = React;
+
+    const MARKETS = [
+      { id: "KR", label: "한국 주식", flag: "🇰🇷", desc: "KOSPI · KOSDAQ" },
+      { id: "US", label: "미국 주식", flag: "🇺🇸", desc: "NYSE · NASDAQ" },
+      { id: "ALL", label: "전체 시장", flag: "🌐", desc: "KR + US" },
+    ];
+
+    const STRATEGIES = [
+      { id: "value", label: "가치투자", icon: "◈", desc: "PER·PBR 저평가 종목" },
+      { id: "dividend", label: "배당주", icon: "◉", desc: "고배당·안정 수익" },
+      { id: "growth", label: "성장주", icon: "▲", desc: "실적 성장 모멘텀" },
+      { id: "turnaround", label: "턴어라운드", icon: "↺", desc: "실적 회복 기대주" },
+    ];
+
+    const buildPrompt = (market, strategy) => {
+      const marketLabel =
+        market === "KR"
+          ? "한국 KOSPI/KOSDAQ"
+          : market === "US"
+          ? "미국 NYSE/NASDAQ"
+          : "한국(KOSPI/KOSDAQ) + 미국(NYSE/NASDAQ)";
+      const strategyMap = {
+        value: "PER, PBR, EV/EBITDA 기준 저평가된",
+        dividend: "배당수익률이 높고 배당 지속성이 우수한",
+        growth: "매출·영업이익 성장률이 높은",
+        turnaround: "실적 턴어라운드가 예상되는",
+      };
+      const today = new Date().toLocaleDateString("ko-KR");
+      return `오늘 날짜(${today}) 기준으로 ${marketLabel} 시장에서 ${strategyMap[strategy]} 저평가 주식 종목 5개를 추천해주세요.
+웹 검색을 통해 최신 시장 데이터를 반영하여 분석해주세요.
+반드시 아래 JSON 형식으로만 응답하세요 (다른 텍스트 없이):
+{
+  "marketSummary": "현재 시장 전반 요약 (2-3문장)",
+  "analysisDate": "분석 기준일",
+  "stocks": [
+    {
+      "ticker": "종목코드",
+      "name": "종목명",
+      "market": "KOSPI/KOSDAQ/NYSE/NASDAQ",
+      "price": "현재가(원 또는 달러)",
+      "currency": "KRW 또는 USD",
+      "per": "PER 수치 또는 N/A",
+      "pbr": "PBR 수치 또는 N/A",
+      "dividendYield": "배당수익률% 또는 N/A",
+      "upside": "목표가 대비 상승여력% (숫자만)",
+      "rating": "매수강도 1-5 (숫자만)",
+      "reason": "추천 이유 (3-4문장, 구체적 수치 포함)",
+      "risk": "주요 리스크 (1-2문장)",
+      "sector": "섹터/업종"
+    }
+  ],
+  "disclaimer": "투자 유의사항"
+}`;
+    };
+
+    const RatingBar = ({ value }) => (
+      <div style={{ display: "flex", gap: 3, alignItems: "center" }}>
+        {[1, 2, 3, 4, 5].map((i) => (
+          <div
+            key={i}
+            style={{
+              width: 10, height: 10, borderRadius: 2,
+              background: i <= value
+                ? value >= 4 ? "#00ff88" : value >= 3 ? "#ffcc00" : "#ff6b6b"
+                : "rgba(255,255,255,0.1)",
+              transition: "all 0.3s",
+            }}
+          />
+        ))}
+      </div>
+    );
+
+    const MetricBadge = ({ label, value, highlight }) => (
+      <div style={{
+        background: highlight ? "rgba(0,255,136,0.1)" : "rgba(255,255,255,0.04)",
+        border: `1px solid ${highlight ? "rgba(0,255,136,0.3)" : "rgba(255,255,255,0.08)"}`,
+        borderRadius: 6, padding: "4px 10px",
+        display: "flex", flexDirection: "column", alignItems: "center", minWidth: 64,
+      }}>
+        <span style={{
+          fontSize: 9, color: "rgba(255,255,255,0.4)",
+          letterSpacing: "0.08em", textTransform: "uppercase", fontFamily: "monospace",
+        }}>{label}</span>
+        <span style={{
+          fontSize: 13, fontWeight: 700,
+          color: highlight ? "#00ff88" : "rgba(255,255,255,0.9)",
+          fontFamily: "monospace", marginTop: 1,
+        }}>{value}</span>
+      </div>
+    );
+
+    const StockCard = ({ stock, index }) => {
+      const [expanded, setExpanded] = useState(false);
+      const upside = parseFloat(stock.upside);
+      const upsideColor = upside >= 30 ? "#00ff88" : upside >= 15 ? "#ffcc00" : "#ff9f43";
+
+      return (
+        <div
+          style={{
+            background: "linear-gradient(135deg, rgba(255,255,255,0.04) 0%, rgba(255,255,255,0.02) 100%)",
+            border: "1px solid rgba(255,255,255,0.08)",
+            borderLeft: `3px solid ${upsideColor}`,
+            borderRadius: 12, padding: "18px 20px", cursor: "pointer",
+            transition: "all 0.2s ease",
+            animation: `fadeSlideIn 0.4s ease ${index * 0.1}s both`,
+          }}
+          onClick={() => setExpanded(!expanded)}
+          onMouseEnter={(e) => {
+            e.currentTarget.style.background = "linear-gradient(135deg, rgba(255,255,255,0.07) 0%, rgba(255,255,255,0.04) 100%)";
+            e.currentTarget.style.borderColor = "rgba(255,255,255,0.15)";
+          }}
+          onMouseLeave={(e) => {
+            e.currentTarget.style.background = "linear-gradient(135deg, rgba(255,255,255,0.04) 0%, rgba(255,255,255,0.02) 100%)";
+            e.currentTarget.style.borderColor = "rgba(255,255,255,0.08)";
+          }}
+        >
+          {/* Header */}
+          <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 12 }}>
+            <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
+              <div style={{
+                width: 28, height: 28, borderRadius: 8,
+                background: `linear-gradient(135deg, ${upsideColor}22, ${upsideColor}44)`,
+                border: `1px solid ${upsideColor}55`,
+                display: "flex", alignItems: "center", justifyContent: "center",
+                fontSize: 11, fontWeight: 800, color: upsideColor, fontFamily: "monospace",
+              }}>{index + 1}</div>
+              <div>
+                <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                  <span style={{ fontSize: 16, fontWeight: 700, color: "#fff", letterSpacing: "-0.02em" }}>
+                    {stock.name}
+                  </span>
+                  <span style={{
+                    fontSize: 11, color: "rgba(255,255,255,0.4)", fontFamily: "monospace",
+                    background: "rgba(255,255,255,0.06)", padding: "1px 6px", borderRadius: 4,
+                  }}>{stock.ticker}</span>
+                </div>
+                <div style={{
+                  fontSize: 11, color: "rgba(255,255,255,0.4)", marginTop: 2,
+                  display: "flex", gap: 6, alignItems: "center",
+                }}>
+                  <span>{stock.market}</span>
+                  <span style={{ opacity: 0.4 }}>·</span>
+                  <span>{stock.sector}</span>
+                </div>
+              </div>
+            </div>
+            <div style={{ textAlign: "right", display: "flex", alignItems: "center", gap: 12 }}>
+              <div>
+                <div style={{
+                  fontSize: 18, fontWeight: 800, color: "#fff",
+                  fontFamily: "monospace", letterSpacing: "-0.03em",
+                }}>{stock.currency === "USD" ? "$" : "₩"}{stock.price}</div>
+                <div style={{
+                  fontSize: 12, color: upsideColor, fontWeight: 700,
+                  fontFamily: "monospace", textAlign: "right",
+                }}>▲ {stock.upside}% 상승여력</div>
+              </div>
+              <div style={{ color: "rgba(255,255,255,0.3)", fontSize: 16 }}>
+                {expanded ? "▲" : "▼"}
+              </div>
+            </div>
+          </div>
+
+          {/* Metrics */}
+          <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginBottom: 10 }}>
+            <MetricBadge label="PER" value={stock.per} />
+            <MetricBadge label="PBR" value={stock.pbr} />
+            <MetricBadge
+              label="배당"
+              value={stock.dividendYield !== "N/A" ? stock.dividendYield + "%" : "N/A"}
+              highlight={parseFloat(stock.dividendYield) >= 3}
+            />
+            <div style={{
+              background: "rgba(255,255,255,0.04)",
+              border: "1px solid rgba(255,255,255,0.08)",
+              borderRadius: 6, padding: "4px 10px",
+              display: "flex", flexDirection: "column", alignItems: "center", minWidth: 64,
+            }}>
+              <span style={{
+                fontSize: 9, color: "rgba(255,255,255,0.4)",
+                letterSpacing: "0.08em", textTransform: "uppercase", fontFamily: "monospace",
+              }}>매수강도</span>
+              <div style={{ marginTop: 3 }}>
+                <RatingBar value={parseInt(stock.rating)} />
+              </div>
+            </div>
+          </div>
+
+          {/* Expanded */}
+          {expanded && (
+            <div style={{
+              marginTop: 14, paddingTop: 14,
+              borderTop: "1px solid rgba(255,255,255,0.07)",
+              animation: "fadeIn 0.2s ease",
+            }}>
+              <div style={{ marginBottom: 10 }}>
+                <div style={{
+                  fontSize: 10, color: "rgba(0,255,136,0.7)",
+                  letterSpacing: "0.1em", textTransform: "uppercase",
+                  fontFamily: "monospace", marginBottom: 5,
+                }}>◈ 추천 근거</div>
+                <p style={{ fontSize: 13, color: "rgba(255,255,255,0.75)", lineHeight: 1.7, margin: 0 }}>
+                  {stock.reason}
+                </p>
+              </div>
+              <div style={{
+                background: "rgba(255,100,100,0.06)",
+                border: "1px solid rgba(255,100,100,0.15)",
+                borderRadius: 8, padding: "8px 12px",
+              }}>
+                <div style={{
+                  fontSize: 10, color: "rgba(255,100,100,0.8)",
+                  letterSpacing: "0.1em", textTransform: "uppercase",
+                  fontFamily: "monospace", marginBottom: 4,
+                }}>⚠ 리스크</div>
+                <p style={{ fontSize: 12, color: "rgba(255,255,255,0.55)", lineHeight: 1.6, margin: 0 }}>
+                  {stock.risk}
+                </p>
+              </div>
+            </div>
+          )}
+        </div>
+      );
+    };
+
+    const SkeletonCard = () => (
+      <div style={{
+        background: "rgba(255,255,255,0.03)",
+        border: "1px solid rgba(255,255,255,0.06)",
+        borderRadius: 12, padding: "18px 20px",
+        animation: "pulse 1.5s ease infinite",
+      }}>
+        {[80, 60, 40].map((w, i) => (
+          <div key={i} style={{
+            height: i === 0 ? 16 : 10, width: `${w}%`,
+            background: "rgba(255,255,255,0.06)", borderRadius: 4, marginBottom: 10,
+          }} />
+        ))}
+      </div>
+    );
+
+    function StockDashboard() {
+      const [selectedMarket, setSelectedMarket] = useState("KR");
+      const [selectedStrategy, setSelectedStrategy] = useState("value");
+      const [loading, setLoading] = useState(false);
+      const [result, setResult] = useState(null);
+      const [error, setError] = useState(null);
+      const [lastUpdated, setLastUpdated] = useState(null);
+      const [streamText, setStreamText] = useState("");
+
+      const analyze = async () => {
+        if (loading) return;
+        setLoading(true);
+        setError(null);
+        setResult(null);
+        setStreamText("웹 데이터 수집 중...");
+
+        try {
+          const prompt = buildPrompt(selectedMarket, selectedStrategy);
+
+          const response = await fetch("/api/analyze", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ prompt }),
+          });
+
+          const data = await response.json();
+
+          if (!response.ok || !data.success) {
+            throw new Error(data.error || "분석 중 오류가 발생했습니다.");
+          }
+
+          setResult(data.data);
+          setLastUpdated(new Date());
+          setStreamText("");
+        } catch (err) {
+          setError(err.message || "분석 중 오류가 발생했습니다.");
+          setStreamText("");
+        } finally {
+          setLoading(false);
+        }
+      };
+
+      return (
+        <div style={{
+          minHeight: "100vh",
+          background: "#090c14",
+          backgroundImage: "radial-gradient(ellipse 80% 50% at 50% -20%, rgba(0,255,136,0.05) 0%, transparent 60%), radial-gradient(ellipse 60% 40% at 80% 80%, rgba(0,100,255,0.04) 0%, transparent 50%)",
+          fontFamily: "'Noto Sans KR', 'IBM Plex Mono', monospace",
+          color: "#fff",
+          padding: "0 0 40px",
+        }}>
+          {/* Header */}
+          <div style={{
+            borderBottom: "1px solid rgba(255,255,255,0.06)",
+            background: "rgba(0,0,0,0.4)",
+            backdropFilter: "blur(20px)",
+            padding: "16px 28px",
+            display: "flex", alignItems: "center", justifyContent: "space-between",
+            position: "sticky", top: 0, zIndex: 100,
+          }}>
+            <div style={{ display: "flex", alignItems: "center", gap: 14 }}>
+              <div style={{
+                width: 36, height: 36, borderRadius: 10,
+                background: "linear-gradient(135deg, #00ff88, #00ccff)",
+                display: "flex", alignItems: "center", justifyContent: "center",
+                fontSize: 16, boxShadow: "0 0 20px rgba(0,255,136,0.3)",
+              }}>📊</div>
+              <div>
+                <div style={{
+                  fontSize: 15, fontWeight: 700, letterSpacing: "-0.02em",
+                  background: "linear-gradient(90deg, #fff, rgba(255,255,255,0.7))",
+                  WebkitBackgroundClip: "text", WebkitTextFillColor: "transparent",
+                }}>AI 저평가 주식 레이더</div>
+                <div style={{
+                  fontSize: 10, color: "rgba(0,255,136,0.6)",
+                  fontFamily: "IBM Plex Mono", letterSpacing: "0.08em",
+                }}>POWERED BY CLAUDE OPUS 4.6 + LIVE WEB SEARCH</div>
+              </div>
+            </div>
+            {lastUpdated && (
+              <div style={{
+                fontSize: 11, color: "rgba(255,255,255,0.3)",
+                fontFamily: "IBM Plex Mono",
+                display: "flex", alignItems: "center", gap: 6,
+              }}>
+                <div style={{
+                  width: 6, height: 6, borderRadius: "50%",
+                  background: "#00ff88", boxShadow: "0 0 8px #00ff88",
+                }} />
+                {lastUpdated.toLocaleString("ko-KR")} 기준
+              </div>
+            )}
+          </div>
+
+          <div style={{ maxWidth: 800, margin: "0 auto", padding: "28px 20px" }}>
+            {/* Market Selector */}
+            <div style={{ marginBottom: 20 }}>
+              <div style={{
+                fontSize: 10, color: "rgba(255,255,255,0.35)",
+                letterSpacing: "0.12em", textTransform: "uppercase",
+                fontFamily: "IBM Plex Mono", marginBottom: 10,
+              }}>MARKET SELECT</div>
+              <div style={{ display: "flex", gap: 10 }}>
+                {MARKETS.map((m) => (
+                  <button key={m.id} onClick={() => setSelectedMarket(m.id)} style={{
+                    flex: 1, padding: "12px 16px",
+                    background: selectedMarket === m.id
+                      ? "linear-gradient(135deg, rgba(0,255,136,0.12), rgba(0,200,255,0.08))"
+                      : "rgba(255,255,255,0.03)",
+                    border: `1px solid ${selectedMarket === m.id ? "rgba(0,255,136,0.4)" : "rgba(255,255,255,0.07)"}`,
+                    borderRadius: 10, cursor: "pointer", transition: "all 0.2s", textAlign: "left",
+                  }}>
+                    <div style={{ fontSize: 20, marginBottom: 4 }}>{m.flag}</div>
+                    <div style={{
+                      fontSize: 13, fontWeight: 600,
+                      color: selectedMarket === m.id ? "#00ff88" : "rgba(255,255,255,0.7)",
+                      letterSpacing: "-0.01em",
+                    }}>{m.label}</div>
+                    <div style={{
+                      fontSize: 10, color: "rgba(255,255,255,0.35)",
+                      fontFamily: "IBM Plex Mono", marginTop: 2,
+                    }}>{m.desc}</div>
+                  </button>
+                ))}
+              </div>
+            </div>
+
+            {/* Strategy Selector */}
+            <div style={{ marginBottom: 24 }}>
+              <div style={{
+                fontSize: 10, color: "rgba(255,255,255,0.35)",
+                letterSpacing: "0.12em", textTransform: "uppercase",
+                fontFamily: "IBM Plex Mono", marginBottom: 10,
+              }}>STRATEGY</div>
+              <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8 }}>
+                {STRATEGIES.map((s) => (
+                  <button key={s.id} onClick={() => setSelectedStrategy(s.id)} style={{
+                    padding: "10px 14px",
+                    background: selectedStrategy === s.id ? "rgba(0,255,136,0.08)" : "rgba(255,255,255,0.02)",
+                    border: `1px solid ${selectedStrategy === s.id ? "rgba(0,255,136,0.35)" : "rgba(255,255,255,0.06)"}`,
+                    borderRadius: 8, cursor: "pointer", transition: "all 0.2s",
+                    display: "flex", alignItems: "center", gap: 10, textAlign: "left",
+                  }}>
+                    <span style={{
+                      fontSize: 16,
+                      color: selectedStrategy === s.id ? "#00ff88" : "rgba(255,255,255,0.4)",
+                      fontFamily: "IBM Plex Mono",
+                    }}>{s.icon}</span>
+                    <div>
+                      <div style={{
+                        fontSize: 12, fontWeight: 600,
+                        color: selectedStrategy === s.id ? "#fff" : "rgba(255,255,255,0.6)",
+                      }}>{s.label}</div>
+                      <div style={{ fontSize: 10, color: "rgba(255,255,255,0.3)", marginTop: 1 }}>
+                        {s.desc}
+                      </div>
+                    </div>
+                  </button>
+                ))}
+              </div>
+            </div>
+
+            {/* Analyze Button */}
+            <button
+              onClick={analyze}
+              disabled={loading}
+              style={{
+                width: "100%", padding: "16px",
+                background: loading
+                  ? "rgba(0,255,136,0.05)"
+                  : "linear-gradient(135deg, rgba(0,255,136,0.15), rgba(0,200,255,0.1))",
+                border: `1px solid ${loading ? "rgba(0,255,136,0.2)" : "rgba(0,255,136,0.5)"}`,
+                borderRadius: 12, cursor: loading ? "not-allowed" : "pointer",
+                color: loading ? "rgba(0,255,136,0.5)" : "#00ff88",
+                fontSize: 14, fontWeight: 700, letterSpacing: "0.05em",
+                fontFamily: "IBM Plex Mono", transition: "all 0.2s",
+                marginBottom: 28,
+                display: "flex", alignItems: "center", justifyContent: "center", gap: 10,
+                boxShadow: loading ? "none" : "0 0 30px rgba(0,255,136,0.1)",
+              }}
+            >
+              {loading ? (
+                <>
+                  <div style={{
+                    width: 16, height: 16,
+                    border: "2px solid rgba(0,255,136,0.2)",
+                    borderTopColor: "rgba(0,255,136,0.6)",
+                    borderRadius: "50%", animation: "spin 0.8s linear infinite",
+                  }} />
+                  {streamText || "AI 분석 중..."}
+                </>
+              ) : (
+                <>⚡ AI 시장 분석 실행</>
+              )}
+            </button>
+
+            {/* Error */}
+            {error && (
+              <div style={{
+                background: "rgba(255,80,80,0.08)",
+                border: "1px solid rgba(255,80,80,0.25)",
+                borderRadius: 10, padding: "14px 18px", marginBottom: 20,
+                fontSize: 13, color: "rgba(255,150,150,0.9)", fontFamily: "IBM Plex Mono",
+              }}>⚠ {error}</div>
+            )}
+
+            {/* Skeletons */}
+            {loading && (
+              <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+                {[1, 2, 3].map((i) => <SkeletonCard key={i} />)}
+              </div>
+            )}
+
+            {/* Results */}
+            {result && !loading && (
+              <div style={{ animation: "fadeIn 0.4s ease" }}>
+                <div style={{
+                  background: "linear-gradient(135deg, rgba(0,100,255,0.08), rgba(0,50,150,0.05))",
+                  border: "1px solid rgba(0,150,255,0.2)",
+                  borderRadius: 12, padding: "16px 20px", marginBottom: 20,
+                }}>
+                  <div style={{
+                    fontSize: 10, color: "rgba(100,180,255,0.7)",
+                    letterSpacing: "0.1em", textTransform: "uppercase",
+                    fontFamily: "IBM Plex Mono", marginBottom: 8,
+                  }}>◈ 시장 현황 ({result.analysisDate})</div>
+                  <p style={{ fontSize: 13, color: "rgba(255,255,255,0.7)", lineHeight: 1.7 }}>
+                    {result.marketSummary}
+                  </p>
+                </div>
+
+                <div style={{
+                  fontSize: 10, color: "rgba(255,255,255,0.3)",
+                  letterSpacing: "0.12em", textTransform: "uppercase",
+                  fontFamily: "IBM Plex Mono", marginBottom: 12,
+                }}>
+                  RECOMMENDED STOCKS — {result.stocks?.length || 0} PICKS · 클릭하여 상세보기
+                </div>
+
+                <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+                  {result.stocks?.map((stock, i) => (
+                    <StockCard key={i} stock={stock} index={i} />
+                  ))}
+                </div>
+
+                <div style={{
+                  marginTop: 20, padding: "12px 16px",
+                  background: "rgba(255,255,255,0.02)",
+                  border: "1px solid rgba(255,255,255,0.05)",
+                  borderRadius: 8, fontSize: 11, color: "rgba(255,255,255,0.25)",
+                  lineHeight: 1.6, fontFamily: "IBM Plex Mono",
+                }}>
+                  ⚠ {result.disclaimer || "본 분석은 AI가 생성한 참고 정보이며 투자 권유가 아닙니다. 투자 판단과 책임은 본인에게 있습니다."}
+                </div>
+              </div>
+            )}
+
+            {/* Empty State */}
+            {!result && !loading && !error && (
+              <div style={{ textAlign: "center", padding: "60px 20px", color: "rgba(255,255,255,0.2)" }}>
+                <div style={{ fontSize: 48, marginBottom: 16, opacity: 0.3 }}>📡</div>
+                <div style={{ fontSize: 14, marginBottom: 6 }}>
+                  시장 및 전략을 선택 후 분석을 실행하세요
+                </div>
+                <div style={{ fontSize: 11, fontFamily: "IBM Plex Mono", color: "rgba(0,255,136,0.3)" }}>
+                  Claude Opus 4.6이 실시간 웹 데이터를 검색하여 분석합니다
+                </div>
+              </div>
+            )}
+          </div>
+        </div>
+      );
+    }
+
+    const root = ReactDOM.createRoot(document.getElementById("root"));
+    root.render(<StockDashboard />);
+  </script>
+</body>
+</html>
