@@ -599,33 +599,6 @@ def check_typos(
     for seg in segments:
         text = seg.text
 
-        # ── 반복 음절 검출 ──
-        for m in REPEATED_SYLLABLE_PATTERN.finditer(text):
-            repeated = m.group()
-            syllable = m.group(1)
-
-            # 의도적 반복 제외 (의성어/의태어 등)
-            intentional = {"하하", "호호", "흐흐", "ㅎㅎ", "ㅋㅋ", "반반", "각각", "일일", "종종"}
-            if repeated in intentional:
-                continue
-
-            conf = 0.7
-            if conf < min_confidence:
-                continue
-
-            # 반복 제거한 추천
-            suggestion = repeated[:len(syllable)]
-
-            issues.append(Issue(
-                issue_type="typo",
-                severity="medium",
-                confidence=conf,
-                original=repeated,
-                suggestion=f"'{suggestion}' (반복 입력 의심)",
-                reason=f"연속 반복 음절 감지: '{syllable}'이(가) 반복됨",
-                location=_make_location(seg),
-            ))
-
         # ── 혼동 용어 검출 ──
         for wrong, right, reason in all_pairs:
             if wrong in text:
@@ -655,7 +628,7 @@ def run_all_checks(
     rules_path: Optional[str] = None,
     min_confidence: float = 0.0,
     disable_consistency: bool = False,
-    disable_structure: bool = False,
+    disable_structure: bool = True,
     disable_date: bool = False,
     disable_typo: bool = False,
 ) -> list[Issue]:
