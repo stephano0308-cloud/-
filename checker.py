@@ -16,7 +16,7 @@ from collections import Counter, defaultdict
 from dataclasses import asdict, dataclass, field
 from typing import Optional
 
-from parser import TextSegment
+from hwpx_parser import TextSegment
 
 logger = logging.getLogger(__name__)
 

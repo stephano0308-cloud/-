@@ -14,7 +14,7 @@ from pathlib import Path
 
 from checker import run_all_checks
 from locator import enrich_segments
-from parser import parse_hwpx
+from hwpx_parser import parse_hwpx
 from reporter import print_console_report, save_csv, save_json
 
 logger = logging.getLogger(__name__)

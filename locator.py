@@ -3,7 +3,7 @@
 TextSegment의 위치 정보를 가독성 높은 location_hint로 변환한다.
 """
 
-from parser import TextSegment
+from hwpx_parser import TextSegment
 
 
 def build_location_hint(segment: TextSegment) -> str:
