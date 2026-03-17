@@ -1,0 +1,10 @@
+# HWPX 문서 일관성 검수 도구 의존성
+# Python 3.11 이상 필요
+# 표준 라이브러리만 사용 (추가 의존성 없음)
+# - zipfile: HWPX 압축 해제
+# - xml.etree.ElementTree: XML 파싱
+# - re: 정규표현식
+# - csv/json: 출력
+# - argparse: CLI
+# - logging: 로그
+# - dataclasses: 데이터 구조

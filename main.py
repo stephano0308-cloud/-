@@ -1,175 +1,246 @@
-"""텔레그램 주식 분석 봇 - 메인 실행 파일"""
+"""HWPX 문서 일관성 검수 CLI.
 
-import asyncio
-import json
-import os
+사용법:
+    python main.py check sample.hwpx
+    python main.py check ./docs --recursive
+    python main.py check sample.hwpx --json out.json --csv out.csv
+"""
+
+import argparse
 import logging
-import ssl
+import os
 import sys
-import urllib.parse
-import urllib.request
-from datetime import timedelta, timezone
+from pathlib import Path
 
-from dotenv import load_dotenv
-from telethon import TelegramClient
-from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from checker import run_all_checks
+from locator import enrich_segments
+from parser import parse_hwpx
+from reporter import print_console_report, save_csv, save_json
 
-from collector import collect_messages, filter_by_stock, load_config
-from analyzer import generate_daily_report
-
-load_dotenv()
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-)
 logger = logging.getLogger(__name__)
 
-BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-API_ID = int(os.getenv("TELEGRAM_API_ID", "0"))
-API_HASH = os.getenv("TELEGRAM_API_HASH", "").strip()
-MY_CHAT_ID = os.getenv("MY_CHAT_ID", "").strip()
-DISABLE_SSL_VERIFY = os.getenv("DISABLE_SSL_VERIFY", "0").strip() == "1"
 
-KST = timezone(timedelta(hours=9))
-
-
-def validate_env():
-    """필수 환경변수가 설정되어 있는지 검증한다."""
-    missing = []
-    if not BOT_TOKEN:
-        missing.append("TELEGRAM_BOT_TOKEN")
-    if API_ID == 0:
-        missing.append("TELEGRAM_API_ID")
-    if not API_HASH:
-        missing.append("TELEGRAM_API_HASH")
-    if not MY_CHAT_ID:
-        missing.append("MY_CHAT_ID")
-    if missing:
-        logger.error(f"필수 환경변수가 설정되지 않았습니다: {', '.join(missing)}")
-        sys.exit(1)
+def setup_logging(verbose: bool = False) -> None:
+    """로깅을 설정한다."""
+    level = logging.DEBUG if verbose else logging.INFO
+    logging.basicConfig(
+        level=level,
+        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
 
 
-def build_ssl_context():
-    if DISABLE_SSL_VERIFY:
-        logger.warning("SSL 인증서 검증을 비활성화합니다. 신뢰된 네트워크에서만 사용하세요.")
-        return ssl._create_unverified_context()
-    return ssl.create_default_context()
+def collect_hwpx_files(path: str, recursive: bool = False) -> list[str]:
+    """경로에서 .hwpx 파일 목록을 수집한다."""
+    target = Path(path)
+    files: list[str] = []
+
+    if target.is_file():
+        if target.suffix.lower() == ".hwpx":
+            files.append(str(target.resolve()))
+        else:
+            logger.warning("HWPX 파일이 아닙니다: %s", path)
+    elif target.is_dir():
+        if recursive:
+            for f in target.rglob("*.hwpx"):
+                files.append(str(f.resolve()))
+        else:
+            for f in target.glob("*.hwpx"):
+                files.append(str(f.resolve()))
+        if not files:
+            logger.warning("HWPX 파일을 찾을 수 없습니다: %s", path)
+    else:
+        logger.error("경로를 찾을 수 없습니다: %s", path)
+
+    files.sort()
+    return files
 
 
-def _create_client():
-    return TelegramClient("stock_bot_session", API_ID, API_HASH)
+def process_single_file(
+    file_path: str,
+    include_table: bool = True,
+    rules_path: str = None,
+    min_confidence: float = 0.0,
+    disable_consistency: bool = False,
+    disable_structure: bool = False,
+    disable_date: bool = False,
+    disable_typo: bool = False,
+) -> list:
+    """단일 HWPX 파일을 처리한다."""
+    logger.info("파일 처리 시작: %s", file_path)
+
+    doc = parse_hwpx(file_path, include_table=include_table)
+    if not doc.segments:
+        logger.warning("텍스트를 추출할 수 없습니다: %s", file_path)
+        return []
+
+    enrich_segments(doc.segments)
+
+    issues = run_all_checks(
+        segments=doc.segments,
+        rules_path=rules_path,
+        min_confidence=min_confidence,
+        disable_consistency=disable_consistency,
+        disable_structure=disable_structure,
+        disable_date=disable_date,
+        disable_typo=disable_typo,
+    )
+
+    return issues
 
 
-async def send_message(text: str):
-    """텔레그램으로 메시지를 전송한다. 4096자 제한에 맞춰 분할 전송."""
-    max_len = 4000
-    chunks = [text[i : i + max_len] for i in range(0, len(text), max_len)]
-    ssl_context = build_ssl_context()
+def cmd_check(args: argparse.Namespace) -> int:
+    """check 서브커맨드를 실행한다."""
+    files = collect_hwpx_files(args.path, recursive=args.recursive)
+    if not files:
+        logger.error("처리할 HWPX 파일이 없습니다.")
+        return 1
 
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+    logger.info("총 %d개 파일 처리 예정", len(files))
 
-    for chunk in chunks:
-        payload = {
-            "chat_id": MY_CHAT_ID,
-            "text": chunk,
-        }
-        data = urllib.parse.urlencode(payload).encode("utf-8")
+    all_issues_by_file: dict[str, list] = {}
+    all_issues_flat: list = []
 
-        def _send(d=data):
-            req = urllib.request.Request(url, data=d, method="POST")
-            with urllib.request.urlopen(req, context=ssl_context, timeout=30) as resp:
-                return resp.read().decode("utf-8")
+    for file_path in files:
+        try:
+            issues = process_single_file(
+                file_path=file_path,
+                include_table=args.include_table,
+                rules_path=args.rules,
+                min_confidence=args.min_confidence,
+                disable_consistency=args.disable_consistency_check,
+                disable_structure=args.disable_structure_check,
+                disable_date=args.disable_date_check,
+                disable_typo=args.disable_typo_check,
+            )
+            all_issues_by_file[file_path] = issues
+            all_issues_flat.extend(issues)
+            print_console_report(issues, source_file=file_path)
+        except Exception as e:
+            logger.error("파일 처리 중 오류 발생 (%s): %s", file_path, e)
+            if args.verbose:
+                import traceback
+                traceback.print_exc()
 
-        last_err = None
-        for attempt in range(3):
-            try:
-                await asyncio.to_thread(_send)
-                last_err = None
-                break
-            except Exception as e:
-                last_err = e
-                logger.warning(f"텔레그램 전송 시도 {attempt + 1}/3 실패: {e}")
-                if attempt < 2:
-                    await asyncio.sleep(1 * (attempt + 1))
+    # 결과 저장
+    if args.json:
+        save_json(all_issues_flat, args.json, source_file=", ".join(files))
 
-        if last_err is not None:
-            logger.error(f"텔레그램 전송 최종 실패: {last_err}")
-            raise last_err
+    if args.csv:
+        save_csv(all_issues_flat, args.csv, source_file=", ".join(files))
 
-        await asyncio.sleep(0.3)
+    # 요약
+    total = len(all_issues_flat)
+    if total > 0:
+        print(f"\n전체 결과: {len(files)}개 파일에서 총 {total}개 이슈 발견")
+    else:
+        print(f"\n전체 결과: {len(files)}개 파일 검수 완료, 이슈 없음")
 
-
-async def daily_job(client: TelegramClient):
-    """매일 실행되는 분석 작업"""
-    logger.info("일일 분석 작업 시작")
-
-    config = load_config()
-    stocks = config["stocks"]
-    channels = config["channels"]
-    hours = config.get("collect_hours", 24)
-
-    if not await client.is_user_authorized():
-        logger.error("Telethon 인증이 필요합니다. 먼저 python auth.py를 실행하세요.")
-        return
-
-    logger.info(f"채널 {len(channels)}개에서 최근 {hours}시간 메시지 수집 중...")
-    messages = await collect_messages(client, channels, hours)
-    logger.info(f"총 {len(messages)}개 메시지 수집 완료")
-
-    stock_data = filter_by_stock(messages, stocks)
-
-    logger.info("종목별 분석 중...")
-    reports = generate_daily_report(stock_data)
-
-    header = "🗓 일일 주식 분석 리포트\n" + "=" * 30
-    await send_message(header)
-
-    for report in reports:
-        await send_message(report)
-        await asyncio.sleep(1)
-
-    footer = "\n✅ 분석 완료. 이 리포트는 AI가 자동 생성한 참고자료입니다."
-    await send_message(footer)
-    logger.info("일일 분석 전송 완료")
+    return 0 if total == 0 else 2
 
 
-async def manual_run():
-    client = _create_client()
-    await client.start()
-    try:
-        await daily_job(client)
-    finally:
-        await client.disconnect()
+def build_parser() -> argparse.ArgumentParser:
+    """CLI 인자 파서를 구성한다."""
+    parser = argparse.ArgumentParser(
+        prog="hwpx-checker",
+        description="HWPX 문서 일관성 검수 및 오탈자 검출 도구",
+    )
+    parser.add_argument(
+        "-v", "--verbose",
+        action="store_true",
+        default=False,
+        help="상세 로그 출력",
+    )
+
+    subparsers = parser.add_subparsers(dest="command", help="사용 가능한 명령")
+
+    # check 서브커맨드
+    check_parser = subparsers.add_parser("check", help="HWPX 파일 검수 실행")
+    check_parser.add_argument(
+        "path",
+        help="HWPX 파일 또는 디렉터리 경로",
+    )
+    check_parser.add_argument(
+        "--recursive",
+        action="store_true",
+        default=False,
+        help="하위 디렉터리까지 재귀 탐색",
+    )
+    check_parser.add_argument(
+        "--include-table",
+        action="store_true",
+        default=False,
+        help="표(table) 내부 텍스트도 검수 대상에 포함",
+    )
+    check_parser.add_argument(
+        "--rules",
+        type=str,
+        default=None,
+        help="규칙 파일(rules.json) 경로",
+    )
+    check_parser.add_argument(
+        "--min-confidence",
+        type=float,
+        default=0.0,
+        help="최소 신뢰도 (0.0~1.0, 이 값 미만의 이슈는 제외)",
+    )
+    check_parser.add_argument(
+        "--json",
+        type=str,
+        default=None,
+        help="결과를 JSON 파일로 저장 (경로 지정)",
+    )
+    check_parser.add_argument(
+        "--csv",
+        type=str,
+        default=None,
+        help="결과를 CSV 파일로 저장 (경로 지정)",
+    )
+    check_parser.add_argument(
+        "--disable-consistency-check",
+        action="store_true",
+        default=False,
+        help="표기 일관성 검사 비활성화",
+    )
+    check_parser.add_argument(
+        "--disable-structure-check",
+        action="store_true",
+        default=False,
+        help="목차 체계 검증 비활성화",
+    )
+    check_parser.add_argument(
+        "--disable-date-check",
+        action="store_true",
+        default=False,
+        help="날짜 형식 검사 비활성화",
+    )
+    check_parser.add_argument(
+        "--disable-typo-check",
+        action="store_true",
+        default=False,
+        help="오탈자 검출 비활성화",
+    )
+
+    return parser
 
 
-async def run_scheduler():
-    validate_env()
+def main() -> int:
+    """메인 진입점."""
+    parser = build_parser()
+    args = parser.parse_args()
 
-    config = load_config()
-    hour = config.get("schedule_hour", 9)
-    minute = config.get("schedule_minute", 0)
+    setup_logging(verbose=getattr(args, "verbose", False))
 
-    client = _create_client()
-    await client.start()
-    logger.info("Telethon 클라이언트 연결 완료")
+    if not args.command:
+        parser.print_help()
+        return 1
 
-    scheduler = AsyncIOScheduler(timezone="Asia/Seoul")
-    scheduler.add_job(daily_job, "cron", hour=hour, minute=minute, args=[client])
-    scheduler.start()
-    logger.info(f"스케줄러 시작 - 매일 {hour:02d}:{minute:02d} KST에 분석 실행")
+    if args.command == "check":
+        return cmd_check(args)
 
-    try:
-        while True:
-            await asyncio.sleep(60)
-    except (KeyboardInterrupt, SystemExit):
-        logger.info("봇 종료 중...")
-        scheduler.shutdown()
-        await client.disconnect()
+    parser.print_help()
+    return 1
 
 
 if __name__ == "__main__":
-    if len(sys.argv) > 1 and sys.argv[1] == "--now":
-        asyncio.run(manual_run())
-    else:
-        asyncio.run(run_scheduler())
+    sys.exit(main())
