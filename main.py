@@ -1,175 +1,466 @@
-"""텔레그램 주식 분석 봇 - 메인 실행 파일"""
+"""HWPX 문서 일관성 검수 CLI.
 
-import asyncio
-import json
-import os
+사용법:
+    python main.py check sample.hwpx
+    python main.py check ./docs --recursive
+    python main.py check sample.hwpx --json out.json --csv out.csv
+"""
+
+import argparse
 import logging
-import ssl
+import os
 import sys
-import urllib.parse
-import urllib.request
-from datetime import timedelta, timezone
+from pathlib import Path
 
-from dotenv import load_dotenv
-from telethon import TelegramClient
-from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from checker import run_all_checks
+from locator import enrich_segments
+from hwpx_parser import parse_hwpx
+from reporter import print_console_report, save_csv, save_json
 
-from collector import collect_messages, filter_by_stock, load_config
-from analyzer import generate_daily_report
-
-load_dotenv()
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-)
 logger = logging.getLogger(__name__)
 
-BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-API_ID = int(os.getenv("TELEGRAM_API_ID", "0"))
-API_HASH = os.getenv("TELEGRAM_API_HASH", "").strip()
-MY_CHAT_ID = os.getenv("MY_CHAT_ID", "").strip()
-DISABLE_SSL_VERIFY = os.getenv("DISABLE_SSL_VERIFY", "0").strip() == "1"
 
-KST = timezone(timedelta(hours=9))
-
-
-def validate_env():
-    """필수 환경변수가 설정되어 있는지 검증한다."""
-    missing = []
-    if not BOT_TOKEN:
-        missing.append("TELEGRAM_BOT_TOKEN")
-    if API_ID == 0:
-        missing.append("TELEGRAM_API_ID")
-    if not API_HASH:
-        missing.append("TELEGRAM_API_HASH")
-    if not MY_CHAT_ID:
-        missing.append("MY_CHAT_ID")
-    if missing:
-        logger.error(f"필수 환경변수가 설정되지 않았습니다: {', '.join(missing)}")
-        sys.exit(1)
+def setup_logging(verbose: bool = False) -> None:
+    """로깅을 설정한다."""
+    level = logging.DEBUG if verbose else logging.INFO
+    logging.basicConfig(
+        level=level,
+        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
 
 
-def build_ssl_context():
-    if DISABLE_SSL_VERIFY:
-        logger.warning("SSL 인증서 검증을 비활성화합니다. 신뢰된 네트워크에서만 사용하세요.")
-        return ssl._create_unverified_context()
-    return ssl.create_default_context()
+def collect_hwpx_files(path: str, recursive: bool = False) -> list[str]:
+    """경로에서 .hwpx 파일 목록을 수집한다."""
+    target = Path(path)
+    files: list[str] = []
+
+    if target.is_file():
+        if target.suffix.lower() == ".hwpx":
+            files.append(str(target.resolve()))
+        else:
+            logger.warning("HWPX 파일이 아닙니다: %s", path)
+    elif target.is_dir():
+        if recursive:
+            for f in target.rglob("*.hwpx"):
+                files.append(str(f.resolve()))
+        else:
+            for f in target.glob("*.hwpx"):
+                files.append(str(f.resolve()))
+        if not files:
+            logger.warning("HWPX 파일을 찾을 수 없습니다: %s", path)
+    else:
+        logger.error("경로를 찾을 수 없습니다: %s", path)
+
+    files.sort()
+    return files
 
 
-def _create_client():
-    return TelegramClient("stock_bot_session", API_ID, API_HASH)
+def process_single_file(
+    file_path: str,
+    include_table: bool = True,
+    rules_path: str = None,
+    min_confidence: float = 0.0,
+    disable_consistency: bool = False,
+    disable_structure: bool = False,
+    disable_date: bool = False,
+    disable_typo: bool = False,
+    law_dict_path: str = None,
+    disable_law: bool = False,
+) -> list:
+    """단일 HWPX 파일을 처리한다."""
+    logger.info("파일 처리 시작: %s", file_path)
+
+    doc = parse_hwpx(file_path, include_table=include_table)
+    if not doc.segments:
+        logger.warning("텍스트를 추출할 수 없습니다: %s", file_path)
+        return []
+
+    enrich_segments(doc.segments)
+
+    issues = run_all_checks(
+        segments=doc.segments,
+        rules_path=rules_path,
+        min_confidence=min_confidence,
+        disable_consistency=disable_consistency,
+        disable_structure=disable_structure,
+        disable_date=disable_date,
+        disable_typo=disable_typo,
+        law_dict_path=law_dict_path,
+        disable_law=disable_law,
+    )
+
+    return issues
 
 
-async def send_message(text: str):
-    """텔레그램으로 메시지를 전송한다. 4096자 제한에 맞춰 분할 전송."""
-    max_len = 4000
-    chunks = [text[i : i + max_len] for i in range(0, len(text), max_len)]
-    ssl_context = build_ssl_context()
+def cmd_check(args: argparse.Namespace) -> int:
+    """check 서브커맨드를 실행한다."""
+    files = collect_hwpx_files(args.path, recursive=args.recursive)
+    if not files:
+        logger.error("처리할 HWPX 파일이 없습니다.")
+        return 1
 
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+    logger.info("총 %d개 파일 처리 예정", len(files))
 
-    for chunk in chunks:
-        payload = {
-            "chat_id": MY_CHAT_ID,
-            "text": chunk,
-        }
-        data = urllib.parse.urlencode(payload).encode("utf-8")
+    all_issues_by_file: dict[str, list] = {}
+    all_issues_flat: list = []
 
-        def _send(d=data):
-            req = urllib.request.Request(url, data=d, method="POST")
-            with urllib.request.urlopen(req, context=ssl_context, timeout=30) as resp:
-                return resp.read().decode("utf-8")
+    for file_path in files:
+        try:
+            issues = process_single_file(
+                file_path=file_path,
+                include_table=args.include_table,
+                rules_path=args.rules,
+                min_confidence=args.min_confidence,
+                disable_consistency=args.disable_consistency_check,
+                disable_structure=not args.enable_structure_check,
+                disable_date=args.disable_date_check,
+                disable_typo=args.disable_typo_check,
+                law_dict_path=args.law_dict or _resource_path("law_names.json"),
+                disable_law=args.disable_law_check,
+            )
+            all_issues_by_file[file_path] = issues
+            all_issues_flat.extend(issues)
+            print_console_report(issues, source_file=file_path)
+        except Exception as e:
+            logger.error("파일 처리 중 오류 발생 (%s): %s", file_path, e)
+            if args.verbose:
+                import traceback
+                traceback.print_exc()
 
-        last_err = None
-        for attempt in range(3):
+    # 결과 저장
+    if args.json:
+        save_json(all_issues_flat, args.json, source_file=", ".join(files))
+
+    if args.csv:
+        save_csv(all_issues_flat, args.csv, source_file=", ".join(files))
+
+    # 요약
+    total = len(all_issues_flat)
+    if total > 0:
+        print(f"\n전체 결과: {len(files)}개 파일에서 총 {total}개 이슈 발견")
+    else:
+        print(f"\n전체 결과: {len(files)}개 파일 검수 완료, 이슈 없음")
+
+    return 0 if total == 0 else 2
+
+
+def build_parser() -> argparse.ArgumentParser:
+    """CLI 인자 파서를 구성한다."""
+    parser = argparse.ArgumentParser(
+        prog="hwpx-checker",
+        description="HWPX 문서 일관성 검수 및 오탈자 검출 도구",
+    )
+    parser.add_argument(
+        "-v", "--verbose",
+        action="store_true",
+        default=False,
+        help="상세 로그 출력",
+    )
+
+    subparsers = parser.add_subparsers(dest="command", help="사용 가능한 명령")
+
+    # check 서브커맨드
+    check_parser = subparsers.add_parser("check", help="HWPX 파일 검수 실행")
+    check_parser.add_argument(
+        "path",
+        help="HWPX 파일 또는 디렉터리 경로",
+    )
+    check_parser.add_argument(
+        "--recursive",
+        action="store_true",
+        default=False,
+        help="하위 디렉터리까지 재귀 탐색",
+    )
+    check_parser.add_argument(
+        "--include-table",
+        action="store_true",
+        default=False,
+        help="표(table) 내부 텍스트도 검수 대상에 포함",
+    )
+    check_parser.add_argument(
+        "--rules",
+        type=str,
+        default=None,
+        help="규칙 파일(rules.json) 경로",
+    )
+    check_parser.add_argument(
+        "--min-confidence",
+        type=float,
+        default=0.0,
+        help="최소 신뢰도 (0.0~1.0, 이 값 미만의 이슈는 제외)",
+    )
+    check_parser.add_argument(
+        "--json",
+        type=str,
+        default=None,
+        help="결과를 JSON 파일로 저장 (경로 지정)",
+    )
+    check_parser.add_argument(
+        "--csv",
+        type=str,
+        default=None,
+        help="결과를 CSV 파일로 저장 (경로 지정)",
+    )
+    check_parser.add_argument(
+        "--disable-consistency-check",
+        action="store_true",
+        default=False,
+        help="표기 일관성 검사 비활성화",
+    )
+    check_parser.add_argument(
+        "--enable-structure-check",
+        action="store_true",
+        default=False,
+        help="목차 체계 검증 활성화 (기본 비활성화)",
+    )
+    check_parser.add_argument(
+        "--disable-date-check",
+        action="store_true",
+        default=False,
+        help="날짜 형식 검사 비활성화",
+    )
+    check_parser.add_argument(
+        "--disable-typo-check",
+        action="store_true",
+        default=False,
+        help="오탈자 검출 비활성화",
+    )
+
+    check_parser.add_argument(
+        "--law-dict",
+        type=str,
+        default=None,
+        help="법령명 사전(law_names.json) 경로 (기본: 프로그램에 포함된 사전)",
+    )
+    check_parser.add_argument(
+        "--disable-law-check",
+        action="store_true",
+        default=False,
+        help="법령명 공식 표기/오탈자 검사 비활성화",
+    )
+
+    # update-laws 서브커맨드
+    update_parser = subparsers.add_parser(
+        "update-laws",
+        help="국가법령정보 Open API로 법령명 사전 갱신",
+    )
+    update_parser.add_argument("--oc", required=True, help="open.law.go.kr 에서 발급받은 OC 값")
+    update_parser.add_argument(
+        "--query",
+        action="append",
+        default=[],
+        help="추가로 수집할 법령 검색어 (여러 번 지정 가능)",
+    )
+    update_parser.add_argument(
+        "--output",
+        type=str,
+        default=None,
+        help="저장 경로 (기본: 실행 파일 옆의 law_names.json)",
+    )
+
+    return parser
+
+
+def _is_frozen() -> bool:
+    """PyInstaller로 빌드된 exe에서 실행 중인지 확인한다."""
+    return getattr(sys, "frozen", False)
+
+
+def _app_dir() -> str:
+    """실행 파일(exe) 또는 main.py가 있는 폴더."""
+    if _is_frozen():
+        return os.path.dirname(os.path.abspath(sys.executable))
+    return os.path.dirname(os.path.abspath(__file__))
+
+
+def _resource_path(name: str) -> str | None:
+    """데이터 파일 경로를 찾는다. 실행 파일 옆의 파일이 번들 파일보다 우선한다."""
+    candidates = [os.path.join(_app_dir(), name)]
+    if _is_frozen():
+        candidates.append(os.path.join(sys._MEIPASS, name))
+    for candidate in candidates:
+        if os.path.isfile(candidate):
+            return candidate
+    return None
+
+
+def cmd_update_laws(args: argparse.Namespace) -> int:
+    """update-laws 서브커맨드를 실행한다."""
+    from law_api import update_law_dict
+
+    source = _resource_path("law_names.json") or os.path.join(_app_dir(), "law_names.json")
+    output = args.output or os.path.join(_app_dir(), "law_names.json")
+    count = update_law_dict(args.oc, source, output_path=output, extra_queries=args.query)
+    if count < 0:
+        return 1
+    print(f"법령명 사전 갱신 완료: {output} ({count}건)")
+    return 0
+
+
+def _wait_before_exit():
+    """exe 실행 시 창이 바로 닫히지 않도록 사용자 입력을 대기한다."""
+    if _is_frozen():
+        print()
+        input("종료하려면 Enter 키를 누르세요...")
+
+
+def _open_file_dialog() -> list[str]:
+    """tkinter 파일 선택 다이얼로그를 열어 HWPX 파일 경로를 반환한다."""
+    try:
+        import tkinter as tk
+        from tkinter import filedialog
+
+        root = tk.Tk()
+        root.withdraw()
+        root.attributes("-topmost", True)
+        root.update()
+
+        file_paths = filedialog.askopenfilenames(
+            title="검수할 HWPX 파일 선택 (여러 파일 선택 가능)",
+            filetypes=[
+                ("HWPX 파일", "*.hwpx"),
+                ("모든 파일", "*.*"),
+            ],
+        )
+        root.destroy()
+        return list(file_paths)
+    except Exception as e:
+        logger.warning("파일 선택 다이얼로그를 열 수 없습니다: %s", e)
+        return []
+
+
+def _save_file_dialog(title: str, default_ext: str, filetypes: list) -> str:
+    """tkinter 저장 다이얼로그를 열어 저장 경로를 반환한다."""
+    try:
+        import tkinter as tk
+        from tkinter import filedialog
+
+        root = tk.Tk()
+        root.withdraw()
+        root.attributes("-topmost", True)
+        root.update()
+
+        file_path = filedialog.asksaveasfilename(
+            title=title,
+            defaultextension=default_ext,
+            filetypes=filetypes,
+        )
+        root.destroy()
+        return file_path or ""
+    except Exception:
+        return ""
+
+
+def _interactive_mode() -> int:
+    """인자 없이 exe를 실행했을 때 파일 선택창을 바로 열고 CSV로 자동 저장한다."""
+    print("=" * 60)
+    print("  HWPX 문서 일관성 검수 도구")
+    print("=" * 60)
+    print()
+
+    while True:
+        print("파일 선택 창을 여는 중...")
+        selected = _open_file_dialog()
+        if not selected:
+            print("파일이 선택되지 않았습니다. 종료합니다.")
+            return 0
+
+        all_files: list[str] = []
+        for p in selected:
+            all_files.extend(collect_hwpx_files(p, recursive=True))
+
+        if not all_files:
+            print("HWPX 파일을 찾을 수 없습니다.\n")
+            continue
+
+        print(f"\n{len(all_files)}개 파일 검수를 시작합니다...\n")
+
+        rules_path = _resource_path("rules.json")
+        law_dict_path = _resource_path("law_names.json")
+        all_issues: list = []
+
+        for file_path in all_files:
             try:
-                await asyncio.to_thread(_send)
-                last_err = None
-                break
+                issues = process_single_file(
+                    file_path=file_path,
+                    include_table=True,
+                    rules_path=rules_path,
+                    disable_structure=True,
+                    law_dict_path=law_dict_path,
+                )
+                all_issues.extend(issues)
+                print_console_report(issues, source_file=file_path)
             except Exception as e:
-                last_err = e
-                logger.warning(f"텔레그램 전송 시도 {attempt + 1}/3 실패: {e}")
-                if attempt < 2:
-                    await asyncio.sleep(1 * (attempt + 1))
+                logger.error("파일 처리 중 오류 발생 (%s): %s", file_path, e)
 
-        if last_err is not None:
-            logger.error(f"텔레그램 전송 최종 실패: {last_err}")
-            raise last_err
+        total = len(all_issues)
+        if total > 0:
+            print(f"전체 결과: {len(all_files)}개 파일에서 총 {total}개 이슈 발견")
+        else:
+            print(f"전체 결과: {len(all_files)}개 파일 검수 완료, 이슈 없음")
 
-        await asyncio.sleep(0.3)
+        # CSV 자동 저장 (첫 번째 입력 파일과 같은 폴더에)
+        if all_issues:
+            first_file = Path(all_files[0])
+            csv_name = first_file.stem + "_검수결과.csv"
+            csv_path = str(first_file.parent / csv_name)
+            save_csv(all_issues, csv_path, source_file=", ".join(all_files))
+            print(f"\nCSV 저장 완료: {csv_path}")
 
-
-async def daily_job(client: TelegramClient):
-    """매일 실행되는 분석 작업"""
-    logger.info("일일 분석 작업 시작")
-
-    config = load_config()
-    stocks = config["stocks"]
-    channels = config["channels"]
-    hours = config.get("collect_hours", 24)
-
-    if not await client.is_user_authorized():
-        logger.error("Telethon 인증이 필요합니다. 먼저 python auth.py를 실행하세요.")
-        return
-
-    logger.info(f"채널 {len(channels)}개에서 최근 {hours}시간 메시지 수집 중...")
-    messages = await collect_messages(client, channels, hours)
-    logger.info(f"총 {len(messages)}개 메시지 수집 완료")
-
-    stock_data = filter_by_stock(messages, stocks)
-
-    logger.info("종목별 분석 중...")
-    reports = generate_daily_report(stock_data)
-
-    header = "🗓 일일 주식 분석 리포트\n" + "=" * 30
-    await send_message(header)
-
-    for report in reports:
-        await send_message(report)
-        await asyncio.sleep(1)
-
-    footer = "\n✅ 분석 완료. 이 리포트는 AI가 자동 생성한 참고자료입니다."
-    await send_message(footer)
-    logger.info("일일 분석 전송 완료")
+        print()
+        again = input("다른 파일을 검수하시겠습니까? (Y/Enter=계속, 그 외=종료)> ").strip().lower()
+        if again not in ("y", ""):
+            print("종료합니다.")
+            return 0
+        print("\n" + "-" * 60 + "\n")
 
 
-async def manual_run():
-    client = _create_client()
-    await client.start()
-    try:
-        await daily_job(client)
-    finally:
-        await client.disconnect()
+def main() -> int:
+    """메인 진입점."""
+    # 콘솔 인코딩이 한글 일부를 표현하지 못해도 프로그램이 죽지 않게 한다
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(errors="replace")
+        except Exception:
+            pass
 
+    setup_logging()
 
-async def run_scheduler():
-    validate_env()
+    # exe 더블클릭 등 인자 없이 실행된 경우 대화형 모드
+    if len(sys.argv) <= 1 and _is_frozen():
+        try:
+            return _interactive_mode()
+        except (KeyboardInterrupt, EOFError):
+            print("\n종료합니다.")
+            return 0
 
-    config = load_config()
-    hour = config.get("schedule_hour", 9)
-    minute = config.get("schedule_minute", 0)
+    parser = build_parser()
+    args = parser.parse_args()
 
-    client = _create_client()
-    await client.start()
-    logger.info("Telethon 클라이언트 연결 완료")
+    setup_logging(verbose=getattr(args, "verbose", False))
 
-    scheduler = AsyncIOScheduler(timezone="Asia/Seoul")
-    scheduler.add_job(daily_job, "cron", hour=hour, minute=minute, args=[client])
-    scheduler.start()
-    logger.info(f"스케줄러 시작 - 매일 {hour:02d}:{minute:02d} KST에 분석 실행")
+    if not args.command:
+        # exe인데 인자가 잘못된 경우
+        if _is_frozen():
+            try:
+                return _interactive_mode()
+            except (KeyboardInterrupt, EOFError):
+                return 0
+        parser.print_help()
+        return 1
 
-    try:
-        while True:
-            await asyncio.sleep(60)
-    except (KeyboardInterrupt, SystemExit):
-        logger.info("봇 종료 중...")
-        scheduler.shutdown()
-        await client.disconnect()
+    if args.command == "check":
+        result = cmd_check(args)
+        _wait_before_exit()
+        return result
+
+    if args.command == "update-laws":
+        return cmd_update_laws(args)
+
+    parser.print_help()
+    return 1
 
 
 if __name__ == "__main__":
-    if len(sys.argv) > 1 and sys.argv[1] == "--now":
-        asyncio.run(manual_run())
-    else:
-        asyncio.run(run_scheduler())
+    sys.exit(main())

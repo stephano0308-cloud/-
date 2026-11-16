@@ -1,0 +1,30 @@
+name: Build Windows exe
+
+on:
+  push:
+    paths:
+      - "**.py"
+      - "*.json"
+      - ".github/workflows/build-exe.yml"
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    env:
+      PYTHONUTF8: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install PyInstaller
+        run: python -m pip install pyinstaller
+      - name: Build
+        run: python build_exe.py
+      - name: Smoke test
+        run: dist\hwpx-checker.exe check --help
+      - uses: actions/upload-artifact@v4
+        with:
+          name: hwpx-checker-windows
+          path: dist/hwpx-checker.exe
