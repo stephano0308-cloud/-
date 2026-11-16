@@ -5,6 +5,7 @@
     python build_exe.py
 """
 
+import os
 import subprocess
 import sys
 
@@ -15,11 +16,14 @@ def main():
         "--onefile",
         "--clean",
         "--name", "hwpx-checker",
-        "--add-data", "rules.json:." if sys.platform != "win32" else "rules.json;.",
+        "--add-data", f"rules.json{os.pathsep}.",
+        "--add-data", f"law_names.json{os.pathsep}.",
         "--hidden-import", "hwpx_parser",
         "--hidden-import", "locator",
         "--hidden-import", "checker",
         "--hidden-import", "reporter",
+        "--hidden-import", "law_checker",
+        "--hidden-import", "law_api",
         "main.py",
     ]
     print(f"빌드 명령: {' '.join(cmd)}")

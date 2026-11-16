@@ -65,6 +65,8 @@ def process_single_file(
     disable_structure: bool = False,
     disable_date: bool = False,
     disable_typo: bool = False,
+    law_dict_path: str = None,
+    disable_law: bool = False,
 ) -> list:
     """단일 HWPX 파일을 처리한다."""
     logger.info("파일 처리 시작: %s", file_path)
@@ -84,6 +86,8 @@ def process_single_file(
         disable_structure=disable_structure,
         disable_date=disable_date,
         disable_typo=disable_typo,
+        law_dict_path=law_dict_path,
+        disable_law=disable_law,
     )
 
     return issues
@@ -112,6 +116,8 @@ def cmd_check(args: argparse.Namespace) -> int:
                 disable_structure=not args.enable_structure_check,
                 disable_date=args.disable_date_check,
                 disable_typo=args.disable_typo_check,
+                law_dict_path=args.law_dict or _resource_path("law_names.json"),
+                disable_law=args.disable_law_check,
             )
             all_issues_by_file[file_path] = issues
             all_issues_flat.extend(issues)
@@ -221,6 +227,38 @@ def build_parser() -> argparse.ArgumentParser:
         help="오탈자 검출 비활성화",
     )
 
+    check_parser.add_argument(
+        "--law-dict",
+        type=str,
+        default=None,
+        help="법령명 사전(law_names.json) 경로 (기본: 프로그램에 포함된 사전)",
+    )
+    check_parser.add_argument(
+        "--disable-law-check",
+        action="store_true",
+        default=False,
+        help="법령명 공식 표기/오탈자 검사 비활성화",
+    )
+
+    # update-laws 서브커맨드
+    update_parser = subparsers.add_parser(
+        "update-laws",
+        help="국가법령정보 Open API로 법령명 사전 갱신",
+    )
+    update_parser.add_argument("--oc", required=True, help="open.law.go.kr 에서 발급받은 OC 값")
+    update_parser.add_argument(
+        "--query",
+        action="append",
+        default=[],
+        help="추가로 수집할 법령 검색어 (여러 번 지정 가능)",
+    )
+    update_parser.add_argument(
+        "--output",
+        type=str,
+        default=None,
+        help="저장 경로 (기본: 실행 파일 옆의 law_names.json)",
+    )
+
     return parser
 
 
@@ -229,16 +267,35 @@ def _is_frozen() -> bool:
     return getattr(sys, "frozen", False)
 
 
-def _get_bundled_rules_path() -> str | None:
-    """exe 번들에 포함된 rules.json 경로를 반환한다."""
+def _app_dir() -> str:
+    """실행 파일(exe) 또는 main.py가 있는 폴더."""
     if _is_frozen():
-        base = sys._MEIPASS
-    else:
-        base = os.path.dirname(os.path.abspath(__file__))
-    candidate = os.path.join(base, "rules.json")
-    if os.path.isfile(candidate):
-        return candidate
+        return os.path.dirname(os.path.abspath(sys.executable))
+    return os.path.dirname(os.path.abspath(__file__))
+
+
+def _resource_path(name: str) -> str | None:
+    """데이터 파일 경로를 찾는다. 실행 파일 옆의 파일이 번들 파일보다 우선한다."""
+    candidates = [os.path.join(_app_dir(), name)]
+    if _is_frozen():
+        candidates.append(os.path.join(sys._MEIPASS, name))
+    for candidate in candidates:
+        if os.path.isfile(candidate):
+            return candidate
     return None
+
+
+def cmd_update_laws(args: argparse.Namespace) -> int:
+    """update-laws 서브커맨드를 실행한다."""
+    from law_api import update_law_dict
+
+    source = _resource_path("law_names.json") or os.path.join(_app_dir(), "law_names.json")
+    output = args.output or os.path.join(_app_dir(), "law_names.json")
+    count = update_law_dict(args.oc, source, output_path=output, extra_queries=args.query)
+    if count < 0:
+        return 1
+    print(f"법령명 사전 갱신 완료: {output} ({count}건)")
+    return 0
 
 
 def _wait_before_exit():
@@ -319,7 +376,8 @@ def _interactive_mode() -> int:
 
         print(f"\n{len(all_files)}개 파일 검수를 시작합니다...\n")
 
-        rules_path = _get_bundled_rules_path()
+        rules_path = _resource_path("rules.json")
+        law_dict_path = _resource_path("law_names.json")
         all_issues: list = []
 
         for file_path in all_files:
@@ -329,6 +387,7 @@ def _interactive_mode() -> int:
                     include_table=True,
                     rules_path=rules_path,
                     disable_structure=True,
+                    law_dict_path=law_dict_path,
                 )
                 all_issues.extend(issues)
                 print_console_report(issues, source_file=file_path)
@@ -388,6 +447,9 @@ def main() -> int:
         result = cmd_check(args)
         _wait_before_exit()
         return result
+
+    if args.command == "update-laws":
+        return cmd_update_laws(args)
 
     parser.print_help()
     return 1

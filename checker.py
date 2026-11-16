@@ -631,13 +631,37 @@ def run_all_checks(
     disable_structure: bool = True,
     disable_date: bool = False,
     disable_typo: bool = False,
+    law_dict_path: Optional[str] = None,
+    disable_law: bool = False,
 ) -> list[Issue]:
     """활성화된 모든 검수를 실행하고 이슈 리스트를 반환한다."""
     all_issues: list[Issue] = []
 
+    law_dict = None
+    if not disable_law and law_dict_path:
+        from law_checker import load_law_dict
+
+        law_dict = load_law_dict(law_dict_path)
+        if not len(law_dict):
+            law_dict = None
+
     if not disable_consistency:
         logger.info("표기 일관성 검사 실행 중...")
-        all_issues.extend(check_consistency(segments, rules_path, min_confidence))
+        consistency_issues = check_consistency(segments, rules_path, min_confidence)
+        if law_dict is not None:
+            # 법령명은 다수결이 아니라 공식 법령명 사전을 기준으로 판정한다
+            from law_checker import mentions_law
+
+            consistency_issues = [
+                i for i in consistency_issues if not mentions_law(i.original, law_dict)
+            ]
+        all_issues.extend(consistency_issues)
+
+    if law_dict is not None:
+        from law_checker import check_law_names
+
+        logger.info("법령명 검사 실행 중... (사전 %d건)", len(law_dict))
+        all_issues.extend(check_law_names(segments, law_dict, min_confidence))
 
     if not disable_structure:
         logger.info("목차 체계 검증 실행 중...")
