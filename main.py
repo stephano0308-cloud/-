@@ -418,6 +418,13 @@ def _interactive_mode() -> int:
 
 def main() -> int:
     """메인 진입점."""
+    # 콘솔 인코딩이 한글 일부를 표현하지 못해도 프로그램이 죽지 않게 한다
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(errors="replace")
+        except Exception:
+            pass
+
     setup_logging()
 
     # exe 더블클릭 등 인자 없이 실행된 경우 대화형 모드
